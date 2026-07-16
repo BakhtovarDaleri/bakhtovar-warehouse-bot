@@ -44,6 +44,7 @@ CATEGORY_BY_COUNTERPARTY_TYPE = {
     "сотрудник": "Зарплата",
 }
 DEFAULT_CATEGORY = "Прочие расходы"
+WAREHOUSE_IP_LABEL = "Склад/Производство"  # служебная метка для закупок сырья — не входит в справочник «Наши ИП»
 
 # Кнопки выбора типа — единая карта на все три раздела (Закупка/Оплата/История)
 TYPE_BUTTONS_SUPPLY = ["🌰 Сырьё", "📦 Расходники"]
@@ -321,25 +322,15 @@ async def supply_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cp = db.get_counterparty_by_name(t)
     context.user_data["s_phone"] = (cp or {}).get("phone", "")
 
-    ips = db.get_my_ip_list()
-    await update.message.reply_text("Шаг 3: Выберите наше ИП:", reply_markup=build_grid_keyboard(ips, columns=2))
-    return SUPPLY_MY_IP
-
-
-async def supply_my_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    context.user_data["s_my_ip"] = t
-
-    db = context.bot_data.get("db")
+    # И сырьё, и расходники приходят общим пулом на склад — ИП не спрашиваем,
+    # распределение по конкретному ИП решается позже, на Фасовке.
+    context.user_data["s_my_ip"] = WAREHOUSE_IP_LABEL
     if context.user_data["s_cp_type"] == "поставщик сырья":
-        # Сырьё — товары, привязанные именно к выбранному ИП
-        items = db.get_products_list(ip_name=t)
+        items = db.get_all_product_names()
     else:
-        # Расходники — единый каталог вид+размер, без привязки к ИП
         items = db.get_consumables_list()
 
-    await update.message.reply_text("Шаг 4: Выберите наименование:", reply_markup=build_grid_keyboard(items, columns=2))
+    await update.message.reply_text("Шаг 3: Выберите наименование:", reply_markup=build_grid_keyboard(items, columns=2))
     return SUPPLY_PRODUCT
 
 
@@ -410,7 +401,26 @@ async def supply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_method=None,
         comment=d["s_comment"],
     )
-    await update.message.reply_text("✅ Данные закупки успешно занесены в базу!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+
+    # Закупка (сырьё или расходники) = физический приход на склад — фиксируем автоматически
+    stock_note = ""
+    if d.get("s_cp_type") in ("поставщик сырья", "поставщик расходников"):
+        flow_type = "сырьё_от_поставщика" if d["s_cp_type"] == "поставщик сырья" else "расходники_от_поставщика"
+        db.add_warehouse_movement(
+            direction="приход",
+            flow_type=flow_type,
+            product_name=d["s_product"],
+            quantity=d["s_qty"],
+            unit=d.get("s_unit", "шт"),
+            movement_date=datetime.now(TZ_MSK).date().isoformat(),
+            counterparty_id=(cp or {}).get("id"),
+            ip_id=None,
+            marketplace=None,
+            note=d["s_comment"],
+        )
+        stock_note = "\n📦 Остаток на складе обновлён автоматически."
+
+    await update.message.reply_text(f"✅ Данные закупки успешно занесены в базу!{stock_note}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -883,7 +893,6 @@ def main():
         states={
             SUPPLY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_category)],
             SUPPLY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_supplier)],
-            SUPPLY_MY_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_my_ip)],
             SUPPLY_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_product)],
             SUPPLY_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_qty)],
             SUPPLY_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_price)],
