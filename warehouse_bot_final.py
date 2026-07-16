@@ -189,7 +189,7 @@ def infer_category_name(counterparty_type: str) -> str:
     REMINDER_TYPE_SELECT, REMINDER_INPUT_FLOW, REMINDER_DATE_SELECT, REMINDER_TIME_SELECT,
     BALANCE_SUPPLIER,
     HISTORY_CATEGORY, HISTORY_SUPPLIER
-) = range(30)
+) = range(31)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
