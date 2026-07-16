@@ -105,6 +105,31 @@ class SupabaseService:
         )
         return res.data or []
 
+    def get_all_product_names(self):
+        """Названия сырья/товаров по всем ИП сразу, без привязки — для прихода на склад."""
+        res = self.client.table("products").select("name").order("name").execute()
+        seen, names = set(), []
+        for r in (res.data or []):
+            n = r["name"]
+            if n not in seen:
+                seen.add(n)
+                names.append(n)
+        return names
+
+    def add_warehouse_movement(self, **fields):
+        self.client.table("warehouse_movements").insert(fields).execute()
+
+    def get_stock_balances(self):
+        """Остаток = сумма приходов минус сумма расходов, по каждому наименованию."""
+        res = self.client.table("warehouse_movements").select("product_name,direction,quantity").execute()
+        balances = {}
+        for r in (res.data or []):
+            name = r["product_name"]
+            qty = float(r["quantity"])
+            delta = qty if r["direction"] == "приход" else -qty
+            balances[name] = balances.get(name, 0.0) + delta
+        return sorted(balances.items())
+
     def get_my_ip_list(self):
         res = self.client.table("ip").select("name").eq("is_active", True).order("name").execute()
         return [r["name"] for r in res.data or []]
@@ -188,8 +213,11 @@ def infer_category_name(counterparty_type: str) -> str:
     ADD_MY_IP_NAME, ADD_MY_IP_CONFIRM, ADD_PRODUCT_NAME, ADD_PRODUCT_IP,
     REMINDER_TYPE_SELECT, REMINDER_INPUT_FLOW, REMINDER_DATE_SELECT, REMINDER_TIME_SELECT,
     BALANCE_SUPPLIER,
-    HISTORY_CATEGORY, HISTORY_SUPPLIER
-) = range(31)
+    HISTORY_CATEGORY, HISTORY_SUPPLIER,
+    WAREHOUSE_MENU,
+    WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
+    WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM
+) = range(43)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -213,7 +241,7 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
 
 
 def get_main_menu_keyboard(user_id):
-    kb = [["📦 Закупка", "💰 Оплата"], ["📜 История", "📊 Баланс"], ["📋 Последние записи", "➕ Добавить"], ["❓ Помощь"]]
+    kb = [["📦 Закупка", "💰 Оплата"], ["📜 История", "📊 Баланс"], ["🏭 Склад", "📋 Последние записи"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -534,6 +562,167 @@ async def history_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# --- WAREHOUSE (СКЛАД) ---
+async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [["📥 Приход сырья", "📤 Фасовка/Отгрузка"], ["📊 Остаток на складе"], ["❌ Главное меню"]]
+    await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    return WAREHOUSE_MENU
+
+
+async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    db = context.bot_data.get("db")
+
+    if t == "📥 Приход сырья":
+        sups = [s["name"] for s in db.get_suppliers_list(type_filter="поставщик сырья")]
+        await update.message.reply_text("Шаг 1: От какого поставщика пришёл товар?", reply_markup=build_grid_keyboard(sups, columns=2))
+        return WAREHOUSE_IN_SUPPLIER
+
+    elif t == "📤 Фасовка/Отгрузка":
+        ips = db.get_my_ip_list()
+        await update.message.reply_text("Шаг 1: На какое ИП фасуем и отгружаем?", reply_markup=build_grid_keyboard(ips, columns=2))
+        return WAREHOUSE_OUT_IP
+
+    elif t == "📊 Остаток на складе":
+        balances = db.get_stock_balances()
+        if not balances:
+            await update.message.reply_text("Склад пуст — движений ещё не было.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        lines = ["📊 *Остаток на складе:*\n"]
+        for name, qty in balances:
+            lines.append(f"▫️ {name}: *{round(qty,2)}* кг/шт")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+        return ConversationHandler.END
+
+    return WAREHOUSE_MENU
+
+
+# --- Приход сырья ---
+async def warehouse_in_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_supplier"] = t
+    db = context.bot_data.get("db")
+    products = db.get_all_product_names()
+    await update.message.reply_text("Шаг 2: Какой товар пришёл?", reply_markup=build_grid_keyboard(products, columns=2))
+    return WAREHOUSE_IN_PRODUCT
+
+
+async def warehouse_in_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_product"] = t
+    await update.message.reply_text("Шаг 3: Сколько кг пришло?", reply_markup=get_step_keyboard())
+    return WAREHOUSE_IN_QTY
+
+
+async def warehouse_in_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try: context.user_data["w_qty"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError: return WAREHOUSE_IN_QTY
+    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+    return WAREHOUSE_IN_COMMENT
+
+
+async def warehouse_in_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_comment"] = t if t != "-" else ""
+    d = context.user_data
+    summary = f"📥 *Приход на склад:*\n🏢 Поставщик: {d['w_supplier']}\n📦 Товар: {d['w_product']}\n⚖️ Вес: {d['w_qty']} кг"
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    return WAREHOUSE_IN_CONFIRM
+
+
+async def warehouse_in_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data.get("db"), context.user_data
+    cp = db.get_counterparty_by_name(d["w_supplier"])
+    db.add_warehouse_movement(
+        direction="приход",
+        flow_type="сырьё_от_поставщика",
+        product_name=d["w_product"],
+        quantity=d["w_qty"],
+        unit="кг",
+        movement_date=datetime.now(TZ_MSK).date().isoformat(),
+        counterparty_id=(cp or {}).get("id"),
+        ip_id=None,
+        marketplace=None,
+        note=d["w_comment"],
+    )
+    await update.message.reply_text("✅ Приход на склад зафиксирован!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+# --- Фасовка / Отгрузка ---
+async def warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_ip"] = t
+    db = context.bot_data.get("db")
+    products = db.get_all_product_names()
+    await update.message.reply_text("Шаг 2: Какой товар фасуем?", reply_markup=build_grid_keyboard(products, columns=2))
+    return WAREHOUSE_OUT_PRODUCT
+
+
+async def warehouse_out_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_product"] = t
+    await update.message.reply_text("Шаг 3: Фасовка (например «200г»):", reply_markup=get_step_keyboard())
+    return WAREHOUSE_OUT_PACKAGING
+
+
+async def warehouse_out_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_packaging"] = t
+    await update.message.reply_text("Шаг 4: Сколько кг всего отгружаем?", reply_markup=get_step_keyboard())
+    return WAREHOUSE_OUT_QTY
+
+
+async def warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try: context.user_data["w_qty"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError: return WAREHOUSE_OUT_QTY
+    kb = [["Ozon", "WB"], ["Яндекс"], ["❌ Главное меню"]]
+    await update.message.reply_text("Шаг 5: Куда отгружаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return WAREHOUSE_OUT_MARKETPLACE
+
+
+async def warehouse_out_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    context.user_data["w_marketplace"] = t
+    d = context.user_data
+    summary = f"📤 *Фасовка/Отгрузка:*\n🏛 ИП: {d['w_ip']}\n📦 Товар: {d['w_product']} ({d['w_packaging']})\n⚖️ Вес: {d['w_qty']} кг\n🛒 Площадка: {t}"
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    return WAREHOUSE_OUT_CONFIRM
+
+
+async def warehouse_out_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data.get("db"), context.user_data
+    db.add_warehouse_movement(
+        direction="расход",
+        flow_type="отгрузка_маркетплейс",
+        product_name=d["w_product"],
+        packaging=d["w_packaging"],
+        quantity=d["w_qty"],
+        unit="кг",
+        movement_date=datetime.now(TZ_MSK).date().isoformat(),
+        counterparty_id=None,
+        ip_id=db.get_ip_id(d["w_ip"]),
+        marketplace=d["w_marketplace"],
+        note="",
+    )
+    await update.message.reply_text("✅ Отгрузка зафиксирована, остаток на складе обновлён!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
 # --- REMINDERS ---
 async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
@@ -724,6 +913,24 @@ def main():
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
 
+    warehouse_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start)],
+        states={
+            WAREHOUSE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_menu)],
+            WAREHOUSE_IN_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_supplier)],
+            WAREHOUSE_IN_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_product)],
+            WAREHOUSE_IN_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_qty)],
+            WAREHOUSE_IN_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_comment)],
+            WAREHOUSE_IN_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_confirm)],
+            WAREHOUSE_OUT_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_ip)],
+            WAREHOUSE_OUT_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_product)],
+            WAREHOUSE_OUT_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_packaging)],
+            WAREHOUSE_OUT_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_qty)],
+            WAREHOUSE_OUT_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_marketplace)],
+            WAREHOUSE_OUT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_confirm)],
+        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+    )
+
     balance_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start)],
         states={BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)]},
@@ -758,6 +965,7 @@ def main():
     application.add_handler(supply_conv)
     application.add_handler(payment_conv)
     application.add_handler(history_conv)
+    application.add_handler(warehouse_conv)
     application.add_handler(balance_conv)
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
