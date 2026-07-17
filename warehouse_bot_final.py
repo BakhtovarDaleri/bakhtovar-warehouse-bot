@@ -294,28 +294,60 @@ async def cancel_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- SUPPLY PROCESS ---
-async def supply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_supply_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [TYPE_BUTTONS_SUPPLY, ["❌ Главное меню"]]
     await update.message.reply_text("📦 *Новая закупка*\n\nШаг 1: Что закупаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+
+
+async def show_supply_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["s_cp_type"])]
+    await update.message.reply_text("Шаг 2: Выберите поставщика:", reply_markup=build_grid_keyboard(sups, columns=2))
+
+
+async def show_supply_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    if context.user_data["s_cp_type"] == "поставщик сырья":
+        items = db.get_all_product_names()
+    else:
+        items = db.get_consumables_list()
+    await update.message.reply_text("Шаг 3: Выберите наименование:", reply_markup=build_grid_keyboard(items, columns=2))
+
+
+async def show_supply_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 4: Введите Количество (число):", reply_markup=get_step_keyboard())
+
+
+async def show_supply_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 5: Введите Цену за единицу:", reply_markup=get_step_keyboard())
+
+
+async def show_supply_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Добавьте комментарий к закупке (или нажмите '-'):", reply_markup=get_step_keyboard())
+
+
+async def supply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_supply_category(update, context)
     return SUPPLY_CATEGORY
 
 
 async def supply_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     if t not in TYPE_BUTTON_TO_DB: return SUPPLY_CATEGORY
     context.user_data["s_type_label"] = t
     context.user_data["s_cp_type"] = TYPE_BUTTON_TO_DB[t]
 
-    db = context.bot_data.get("db")
-    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["s_cp_type"])]
-    await update.message.reply_text("Шаг 2: Выберите поставщика:", reply_markup=build_grid_keyboard(sups, columns=2))
+    await show_supply_supplier(update, context)
     return SUPPLY_SUPPLIER
 
 
 async def supply_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_supply_category(update, context)
+        return SUPPLY_CATEGORY
     context.user_data["s_supplier"] = t
 
     db = context.bot_data.get("db")
@@ -325,56 +357,71 @@ async def supply_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # И сырьё, и расходники приходят общим пулом на склад — ИП не спрашиваем,
     # распределение по конкретному ИП решается позже, на Фасовке.
     context.user_data["s_my_ip"] = WAREHOUSE_IP_LABEL
-    if context.user_data["s_cp_type"] == "поставщик сырья":
-        context.user_data["s_unit"] = "кг"
-        items = db.get_all_product_names()
-    else:
-        context.user_data["s_unit"] = "шт"
-        items = db.get_consumables_list()
+    context.user_data["s_unit"] = "кг" if context.user_data["s_cp_type"] == "поставщик сырья" else "шт"
 
-    await update.message.reply_text("Шаг 3: Выберите наименование:", reply_markup=build_grid_keyboard(items, columns=2))
+    await show_supply_product(update, context)
     return SUPPLY_PRODUCT
 
 
 async def supply_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_supply_supplier(update, context)
+        return SUPPLY_SUPPLIER
     context.user_data["s_product"] = t
-    await update.message.reply_text("Шаг 4: Введите Количество (число):", reply_markup=get_step_keyboard())
+    await show_supply_qty(update, context)
     return SUPPLY_QTY
 
 
 async def supply_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_supply_product(update, context)
+        return SUPPLY_PRODUCT
     try: context.user_data["s_qty"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError: return SUPPLY_QTY
-    await update.message.reply_text("Шаг 5: Введите Цену за единицу:", reply_markup=get_step_keyboard())
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число, например 500. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return SUPPLY_QTY
+    await show_supply_price(update, context)
     return SUPPLY_PRICE
 
 
 async def supply_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_supply_qty(update, context)
+        return SUPPLY_QTY
     try: context.user_data["s_price"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError: return SUPPLY_PRICE
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число, например 260. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return SUPPLY_PRICE
     context.user_data["s_total"] = round(context.user_data["s_qty"] * context.user_data["s_price"], 2)
-    await update.message.reply_text("Добавьте комментарий к закупке (или нажмите '-'):", reply_markup=get_step_keyboard())
+    await show_supply_comment(update, context)
     return SUPPLY_COMMENT
 
 
 async def supply_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_supply_price(update, context)
+        return SUPPLY_PRICE
     context.user_data["s_comment"] = t if t != "-" else ""
     d = context.user_data
     summary = f"📋 *Проверка закупки:*\n🏢 Поставщик: {d['s_supplier']}\n📦 Товар: {d['s_product']}\n🔢 Кол-во: {d['s_qty']} {d['s_unit']}\n💰 Сумма: {d['s_total']} ₽"
-    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return SUPPLY_CONFIRM
 
 
 async def supply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await show_supply_comment(update, context)
+        return SUPPLY_COMMENT
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
 
     cp = db.get_counterparty_by_name(d["s_supplier"])
@@ -419,72 +466,111 @@ async def supply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- PAYMENT PROCESS ---
-async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_payment_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [TYPE_BUTTONS_FULL, ["❌ Главное меню"]]
     await update.message.reply_text("💰 *Внесение оплаты*\n\nШаг 1: Кому платим?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+
+
+async def show_payment_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["p_cp_type"])]
+    await update.message.reply_text("Шаг 2: Выберите получателя:", reply_markup=build_grid_keyboard(sups, columns=2))
+
+
+async def show_payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    debt = db.get_supplier_current_debt(context.user_data["p_supplier"])
+    kb = [[f"{debt}"], ["Ввести сумму вручную"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text(f"Шаг 3: Текущий долг перед получателем: *{debt} ₽*.\nВыберите готовую сумму долга или нажмите ввод вручную:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+
+
+async def show_payment_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 4: Выберите тип счёта оплаты:", reply_markup=ReplyKeyboardMarkup([["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True))
+
+
+async def show_payment_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Добавьте комментарий (или '-'):", reply_markup=get_step_keyboard())
+
+
+async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_payment_category(update, context)
     return PAYMENT_CATEGORY
 
 
 async def payment_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     if t not in TYPE_BUTTON_TO_DB: return PAYMENT_CATEGORY
     context.user_data["p_cp_type"] = TYPE_BUTTON_TO_DB[t]
 
-    db = context.bot_data.get("db")
-    sups = [s["name"] for s in db.get_suppliers_list(type_filter=context.user_data["p_cp_type"])]
-    await update.message.reply_text("Шаг 2: Выберите получателя:", reply_markup=build_grid_keyboard(sups, columns=2))
+    await show_payment_supplier(update, context)
     return PAYMENT_SUPPLIER
 
 
 async def payment_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_payment_category(update, context)
+        return PAYMENT_CATEGORY
     context.user_data["p_supplier"] = t
 
     db = context.bot_data.get("db")
     cp = db.get_counterparty_by_name(t)
     context.user_data["p_phone"] = (cp or {}).get("phone", "")
 
-    debt = db.get_supplier_current_debt(t)
-    kb = [[f"{debt}"], ["Ввести сумму вручную"], ["❌ Главное меню"]]
-    await update.message.reply_text(f"Шаг 3: Текущий долг перед получателем: *{debt} ₽*.\nВыберите готовую сумму долга или нажмите ввод вручную:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    await show_payment_amount(update, context)
     return PAYMENT_AMOUNT
 
 
 async def payment_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_payment_supplier(update, context)
+        return PAYMENT_SUPPLIER
     if t == "Ввести сумму вручную":
         await update.message.reply_text("Введите точную сумму платежа цифрами:", reply_markup=get_step_keyboard())
         return PAYMENT_AMOUNT
 
     try: context.user_data["p_amount"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError: return PAYMENT_AMOUNT
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число, например 5000. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return PAYMENT_AMOUNT
 
-    await update.message.reply_text("Шаг 3: Выберите тип счёта оплаты:", reply_markup=ReplyKeyboardMarkup([["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["❌ Главное меню"]], resize_keyboard=True))
+    await show_payment_type(update, context)
     return PAYMENT_TYPE
 
 
 async def payment_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_payment_amount(update, context)
+        return PAYMENT_AMOUNT
     context.user_data["p_type"] = t
-    await update.message.reply_text("Добавьте комментарий (или '-'):", reply_markup=get_step_keyboard())
+    await show_payment_comment(update, context)
     return PAYMENT_COMMENT
 
 
 async def payment_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_payment_type(update, context)
+        return PAYMENT_TYPE
     context.user_data["p_comment"] = t if t != "-" else ""
     d = context.user_data
-    await update.message.reply_text(f"💰 *Платёж:*\n🏢 Получатель: {d['p_supplier']}\n💰 Сумма: {d['p_amount']} ₽\n🏦 Счёт: {d['p_type']}", reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(f"💰 *Платёж:*\n🏢 Получатель: {d['p_supplier']}\n💰 Сумма: {d['p_amount']} ₽\n🏦 Счёт: {d['p_type']}", reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return PAYMENT_CONFIRM
 
 
 async def payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await show_payment_comment(update, context)
+        return PAYMENT_COMMENT
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
 
     cp = db.get_counterparty_by_name(d["p_supplier"])
@@ -515,23 +601,28 @@ async def balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     debt = context.bot_data.get("db").get_supplier_current_debt(t)
     await update.message.reply_text(f"📊 Контрагент: `{t}`\n💰 Текущий баланс долга: *{debt}* ₽", reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
     return ConversationHandler.END
 
 
 # --- HISTORY BY SUPPLIER ---
-async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_history_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [TYPE_BUTTONS_FULL, ["❌ Главное меню"]]
     await update.message.reply_text("📜 *История по контрагенту*\n\nШаг 1: Какой тип?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+
+
+async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_history_category(update, context)
     return HISTORY_CATEGORY
 
 
 async def history_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     if t not in TYPE_BUTTON_TO_DB: return HISTORY_CATEGORY
+    context.user_data["h_type"] = TYPE_BUTTON_TO_DB[t]
     db = context.bot_data.get("db")
     sups = [s["name"] for s in db.get_suppliers_list(type_filter=TYPE_BUTTON_TO_DB[t])]
     await update.message.reply_text("Шаг 2: Выберите контрагента:", reply_markup=build_grid_keyboard(sups, columns=2))
@@ -541,6 +632,9 @@ async def history_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_history_category(update, context)
+        return HISTORY_CATEGORY
     db = context.bot_data.get("db")
     cp = db.get_counterparty_by_name(t)
     if not cp:
@@ -575,7 +669,7 @@ async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
 
     if t == "📥 Приход сырья":
@@ -603,45 +697,79 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Приход сырья ---
-async def warehouse_in_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    context.user_data["w_supplier"] = t
+async def show_warehouse_in_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    sups = [s["name"] for s in db.get_suppliers_list(type_filter="поставщик сырья")]
+    await update.message.reply_text("Шаг 1: От какого поставщика пришёл товар?", reply_markup=build_grid_keyboard(sups, columns=2))
+
+
+async def show_warehouse_in_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     products = db.get_all_product_names()
     await update.message.reply_text("Шаг 2: Какой товар пришёл?", reply_markup=build_grid_keyboard(products, columns=2))
+
+
+async def show_warehouse_in_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 3: Сколько кг пришло?", reply_markup=get_step_keyboard())
+
+
+async def show_warehouse_in_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+
+
+async def warehouse_in_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await warehouse_start(update, context)
+    context.user_data["w_supplier"] = t
+    await show_warehouse_in_product(update, context)
     return WAREHOUSE_IN_PRODUCT
 
 
 async def warehouse_in_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_in_supplier(update, context)
+        return WAREHOUSE_IN_SUPPLIER
     context.user_data["w_product"] = t
-    await update.message.reply_text("Шаг 3: Сколько кг пришло?", reply_markup=get_step_keyboard())
+    await show_warehouse_in_qty(update, context)
     return WAREHOUSE_IN_QTY
 
 
 async def warehouse_in_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_in_product(update, context)
+        return WAREHOUSE_IN_PRODUCT
     try: context.user_data["w_qty"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError: return WAREHOUSE_IN_QTY
-    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число, например 500. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return WAREHOUSE_IN_QTY
+    await show_warehouse_in_comment(update, context)
     return WAREHOUSE_IN_COMMENT
 
 
 async def warehouse_in_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_in_qty(update, context)
+        return WAREHOUSE_IN_QTY
     context.user_data["w_comment"] = t if t != "-" else ""
     d = context.user_data
     summary = f"📥 *Приход на склад:*\n🏢 Поставщик: {d['w_supplier']}\n📦 Товар: {d['w_product']}\n⚖️ Вес: {d['w_qty']} кг"
-    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_IN_CONFIRM
 
 
 async def warehouse_in_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await show_warehouse_in_comment(update, context)
+        return WAREHOUSE_IN_COMMENT
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
     cp = db.get_counterparty_by_name(d["w_supplier"])
     db.add_warehouse_movement(
@@ -661,54 +789,95 @@ async def warehouse_in_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # --- Фасовка / Отгрузка ---
-async def warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    context.user_data["w_ip"] = t
+async def show_warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = context.bot_data.get("db")
+    ips = db.get_my_ip_list()
+    await update.message.reply_text("Шаг 1: На какое ИП фасуем и отгружаем?", reply_markup=build_grid_keyboard(ips, columns=2))
+
+
+async def show_warehouse_out_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     products = db.get_all_product_names()
     await update.message.reply_text("Шаг 2: Какой товар фасуем?", reply_markup=build_grid_keyboard(products, columns=2))
+
+
+async def show_warehouse_out_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 3: Фасовка (например «200г»):", reply_markup=get_step_keyboard())
+
+
+async def show_warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 4: Сколько кг всего отгружаем?", reply_markup=get_step_keyboard())
+
+
+async def show_warehouse_out_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [["Ozon", "WB"], ["Яндекс"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text("Шаг 5: Куда отгружаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+
+
+async def warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await warehouse_start(update, context)
+    context.user_data["w_ip"] = t
+    await show_warehouse_out_product(update, context)
     return WAREHOUSE_OUT_PRODUCT
 
 
 async def warehouse_out_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_out_ip(update, context)
+        return WAREHOUSE_OUT_IP
     context.user_data["w_product"] = t
-    await update.message.reply_text("Шаг 3: Фасовка (например «200г»):", reply_markup=get_step_keyboard())
+    await show_warehouse_out_packaging(update, context)
     return WAREHOUSE_OUT_PACKAGING
 
 
 async def warehouse_out_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_out_product(update, context)
+        return WAREHOUSE_OUT_PRODUCT
     context.user_data["w_packaging"] = t
-    await update.message.reply_text("Шаг 4: Сколько кг всего отгружаем?", reply_markup=get_step_keyboard())
+    await show_warehouse_out_qty(update, context)
     return WAREHOUSE_OUT_QTY
 
 
 async def warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_out_packaging(update, context)
+        return WAREHOUSE_OUT_PACKAGING
     try: context.user_data["w_qty"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError: return WAREHOUSE_OUT_QTY
-    kb = [["Ozon", "WB"], ["Яндекс"], ["❌ Главное меню"]]
-    await update.message.reply_text("Шаг 5: Куда отгружаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число, например 200. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return WAREHOUSE_OUT_QTY
+    await show_warehouse_out_marketplace(update, context)
     return WAREHOUSE_OUT_MARKETPLACE
 
 
 async def warehouse_out_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await show_warehouse_out_qty(update, context)
+        return WAREHOUSE_OUT_QTY
     context.user_data["w_marketplace"] = t
     d = context.user_data
     summary = f"📤 *Фасовка/Отгрузка:*\n🏛 ИП: {d['w_ip']}\n📦 Товар: {d['w_product']} ({d['w_packaging']})\n⚖️ Вес: {d['w_qty']} кг\n🛒 Площадка: {t}"
-    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_OUT_CONFIRM
 
 
 async def warehouse_out_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text.strip() != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await show_warehouse_out_marketplace(update, context)
+        return WAREHOUSE_OUT_MARKETPLACE
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
     db.add_warehouse_movement(
         direction="расход",
@@ -737,7 +906,7 @@ async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reminder_type_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     context.user_data["rem_flow"] = t
     await update.message.reply_text("Введите текст напоминания (Что конкретно сделать?):", reply_markup=get_step_keyboard())
     return REMINDER_INPUT_FLOW
@@ -745,7 +914,7 @@ async def reminder_type_select(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def reminder_input_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     context.user_data["rem_desc"] = t
 
     t_now = datetime.now(TZ_MSK)
@@ -758,7 +927,7 @@ async def reminder_input_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def reminder_date_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     if "Сегодня" in t or "Завтра" in t:
         context.user_data["rem_date"] = t.split("(")[1].replace(")", "").strip()
     else:
@@ -775,7 +944,7 @@ async def send_reminder_callback(context: ContextTypes.DEFAULT_TYPE):
 
 async def reminder_time_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
 
     full_dt_str = f"{context.user_data['rem_date']} {t}"
     try:
@@ -831,7 +1000,7 @@ async def add_supplier_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_supplier_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     type_map = {"🌰 Сырьё": "поставщик сырья", "📦 Расходники": "поставщик расходников", "👤 Сотрудник": "сотрудник"}
     type_ = type_map.get(t, "поставщик сырья")
 
@@ -851,7 +1020,7 @@ async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_product_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
     db.add_product(context.user_data["new_product_name"], ip_id=db.get_ip_id(t), unit="шт")
     await update.message.reply_text("✅ Новый товар успешно занесен в перечень товаров!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
