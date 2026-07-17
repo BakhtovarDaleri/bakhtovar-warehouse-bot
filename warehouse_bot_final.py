@@ -242,7 +242,7 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
 
 
 def get_main_menu_keyboard(user_id):
-    kb = [["📦 Закупка", "💰 Оплата"], ["📜 История", "📊 Баланс"], ["🏭 Склад", "📋 Последние записи"], ["➕ Добавить", "❓ Помощь"]]
+    kb = [["📦 Закупка", "💰 Оплата"], ["📜 История", "📊 Баланс"], ["🏭 Склад", "➕ Добавить"], ["❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
@@ -326,8 +326,10 @@ async def supply_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # распределение по конкретному ИП решается позже, на Фасовке.
     context.user_data["s_my_ip"] = WAREHOUSE_IP_LABEL
     if context.user_data["s_cp_type"] == "поставщик сырья":
+        context.user_data["s_unit"] = "кг"
         items = db.get_all_product_names()
     else:
+        context.user_data["s_unit"] = "шт"
         items = db.get_consumables_list()
 
     await update.message.reply_text("Шаг 3: Выберите наименование:", reply_markup=build_grid_keyboard(items, columns=2))
@@ -338,7 +340,7 @@ async def supply_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     context.user_data["s_product"] = t
-    await update.message.reply_text("Шаг 5: Введите Количество (число):", reply_markup=get_step_keyboard())
+    await update.message.reply_text("Шаг 4: Введите Количество (число):", reply_markup=get_step_keyboard())
     return SUPPLY_QTY
 
 
@@ -347,7 +349,7 @@ async def supply_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     try: context.user_data["s_qty"] = float(t.replace(",", ".").replace(" ", ""))
     except ValueError: return SUPPLY_QTY
-    await update.message.reply_text("Шаг 6: Введите Цену за единицу:", reply_markup=get_step_keyboard())
+    await update.message.reply_text("Шаг 5: Введите Цену за единицу:", reply_markup=get_step_keyboard())
     return SUPPLY_PRICE
 
 
@@ -356,14 +358,6 @@ async def supply_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     try: context.user_data["s_price"] = float(t.replace(",", ".").replace(" ", ""))
     except ValueError: return SUPPLY_PRICE
-    await update.message.reply_text("Шаг 7: Выберите единицу измерения:", reply_markup=ReplyKeyboardMarkup([["кг", "шт"], ["❌ Главное меню"]], resize_keyboard=True))
-    return SUPPLY_UNIT
-
-
-async def supply_unit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    context.user_data["s_unit"] = t
     context.user_data["s_total"] = round(context.user_data["s_qty"] * context.user_data["s_price"], 2)
     await update.message.reply_text("Добавьте комментарий к закупке (или нажмите '-'):", reply_markup=get_step_keyboard())
     return SUPPLY_COMMENT
@@ -879,8 +873,7 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "📋 Последние записи": await last_records(update, context)
-    elif t == "❓ Помощь": await update.message.reply_text(RULES_TEXT, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    if t == "❓ Помощь": await update.message.reply_text(RULES_TEXT, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
 
 
 def main():
@@ -896,7 +889,6 @@ def main():
             SUPPLY_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_product)],
             SUPPLY_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_qty)],
             SUPPLY_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_price)],
-            SUPPLY_UNIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_unit)],
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
