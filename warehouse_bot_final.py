@@ -3,6 +3,7 @@ Telegram Bot for Supply & Payment Accounting
 Version 7.0.0 - Migrated from Google Sheets to Supabase (Postgres)
 """
 import os
+import re
 import logging
 from datetime import datetime, timedelta
 import zoneinfo
@@ -917,6 +918,20 @@ async def warehouse_in_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+def parse_packaging_grams(text: str):
+    """Пытается вытащить вес одной упаковки в граммах из текста фасовки: '200г', '1кг', '0.5 кг' и т.п."""
+    raw = text.strip().lower().replace(" ", "").replace(",", ".")
+    m = re.match(r"^([\d.]+)(г|гр|грамм|кг|kg|g)?$", raw)
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    unit = m.group(2) or "г"
+    return value * 1000 if unit in ("кг", "kg") else value
+
+
 # --- Фасовка / Отгрузка (одна отгрузка — несколько позиций) ---
 async def show_warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
@@ -937,7 +952,19 @@ async def show_warehouse_out_packaging(update: Update, context: ContextTypes.DEF
 
 
 async def show_warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"«{context.user_data['w_cur_product']}» ({context.user_data['w_cur_packaging']}) — сколько кг?", reply_markup=get_step_keyboard())
+    grams = parse_packaging_grams(context.user_data["w_cur_packaging"])
+    context.user_data["w_cur_grams"] = grams
+    if grams:
+        await update.message.reply_text(
+            f"«{context.user_data['w_cur_product']}» ({context.user_data['w_cur_packaging']}) — сколько штук (упаковок)?",
+            reply_markup=get_step_keyboard()
+        )
+    else:
+        # Не удалось распознать вес фасовки — просим вес напрямую, как раньше
+        await update.message.reply_text(
+            f"«{context.user_data['w_cur_product']}» ({context.user_data['w_cur_packaging']}) — не понял вес фасовки, введите общий вес в кг:",
+            reply_markup=get_step_keyboard()
+        )
 
 
 def warehouse_cart_text(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -945,7 +972,10 @@ def warehouse_cart_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     lines = []
     total_qty = 0.0
     for i, it in enumerate(items, 1):
-        lines.append(f"{i}. {it['product']} ({it['packaging']}) — {it['qty']} кг")
+        if it.get("pieces") is not None:
+            lines.append(f"{i}. {it['product']} ({it['packaging']}) — {it['pieces']} уп. = {it['qty']} кг")
+        else:
+            lines.append(f"{i}. {it['product']} ({it['packaging']}) — {it['qty']} кг")
         total_qty += it["qty"]
     return "\n".join(lines), round(total_qty, 2)
 
@@ -1005,16 +1035,30 @@ async def warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "🔙 Назад":
         await show_warehouse_out_packaging(update, context)
         return WAREHOUSE_OUT_PACKAGING
-    try: qty = float(t.replace(",", ".").replace(" ", ""))
+    try: value = float(t.replace(",", ".").replace(" ", ""))
     except ValueError:
-        await update.message.reply_text("⚠️ Нужно ввести число, например 200. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
         return WAREHOUSE_OUT_QTY
 
-    context.user_data.setdefault("w_items", []).append({
-        "product": context.user_data["w_cur_product"],
-        "packaging": context.user_data["w_cur_packaging"],
-        "qty": qty,
-    })
+    grams = context.user_data.get("w_cur_grams")
+    if grams:
+        pieces = value
+        qty_kg = round(grams * pieces / 1000, 3)
+        item = {
+            "product": context.user_data["w_cur_product"],
+            "packaging": context.user_data["w_cur_packaging"],
+            "pieces": pieces,
+            "qty": qty_kg,
+        }
+    else:
+        item = {
+            "product": context.user_data["w_cur_product"],
+            "packaging": context.user_data["w_cur_packaging"],
+            "pieces": None,
+            "qty": value,
+        }
+
+    context.user_data.setdefault("w_items", []).append(item)
     await show_warehouse_out_add_more(update, context)
     return WAREHOUSE_OUT_ADD_MORE
 
