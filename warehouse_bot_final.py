@@ -313,14 +313,37 @@ class SupabaseService:
         return rows[0] if rows else None
 
     def get_period_pnl(self, date_from: str, date_to: str):
-        """Настоящий P&L за период — только по фактическим операциям, без оценок."""
-        sales = self.client.table("sales").select("net_revenue,sale_date").gte("sale_date", date_from).lte("sale_date", date_to).execute().data or []
-        revenue = sum(float(s["net_revenue"]) for s in sales)
+        """
+        Настоящий P&L за период:
+        - Выручка = реальные поступления от площадок (когда деньги пришли на счёт)
+        - Себестоимость = списана в момент ОТГРУЗКИ (проводки на счёт 5950), а не в момент закупки
+        - Закупка сырья/расходников сама по себе НЕ расход — это просто превращение денег в запасы
+        - Прочие периодные расходы (зарплата, аренда, подписки) — как обычно, по факту начисления
+        """
+        # Выручка — только реальные поступления от площадок
+        rev_ops = (
+            self.client.table("operations").select("amount")
+            .eq("operation_type", "поступление")
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .execute().data or []
+        )
+        revenue = sum(float(r["amount"]) for r in rev_ops)
 
+        # Себестоимость реализованной продукции — из проводок, списанных при отгрузке
+        cogs_account_id = self.get_account_id("5950")
+        cogs_entries = (
+            self.client.table("journal_entries").select("amount")
+            .eq("debit_account_id", cogs_account_id)
+            .gte("entry_date", date_from).lte("entry_date", date_to)
+            .execute().data or []
+        )
+        cogs_total = sum(float(e["amount"]) for e in cogs_entries)
+
+        # Прочие расходы периода — зарплата и постоянные расходы (НЕ закупка сырья/расходников)
         ops = (
             self.client.table("operations")
             .select("amount,category_id,operation_type,operation_date")
-            .in_("operation_type", ["покупка", "начисление", "расход"])
+            .in_("operation_type", ["начисление", "расход"])
             .gte("operation_date", date_from)
             .lte("operation_date", date_to)
             .execute().data or []
@@ -328,8 +351,8 @@ class SupabaseService:
         cats = self.client.table("categories").select("id,name").execute().data or []
         cat_map = {c["id"]: c["name"] for c in cats}
 
-        by_category = {}
-        total_expenses = 0.0
+        by_category = {"Себестоимость реализованной продукции": cogs_total}
+        total_expenses = cogs_total
         for r in ops:
             name = cat_map.get(r["category_id"], "Без категории")
             amt = float(r["amount"])
@@ -424,9 +447,9 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
 
 
 def get_main_menu_keyboard(user_id):
-    kb = [["📦 Закупка", "💰 Оплата"], ["💵 Продажа", "📈 Прибыль"], ["📜 История", "📊 Баланс"], ["🏭 Склад", "👤 Сотрудники"], ["➕ Добавить", "❓ Помощь"]]
+    kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "👤 Сотрудники"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
-        kb[4].append("⏰ Напомнить")
+        kb[3].append("⏰ Напомнить")
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -1088,7 +1111,6 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb2 = [
             ["Аренда склада", "Договор оказания услуг"],
             ["Пропуск", "Коммунальные услуги"],
-            ["Подписка на площадку", "Прочее"],
             ["🔙 Назад", "❌ Главное меню"],
         ]
         await update.message.reply_text("Шаг 1: Категория расхода:", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True))
@@ -1102,8 +1124,6 @@ WAREHOUSE_EXPENSE_CATEGORY_MAP = {
     "Договор оказания услуг": "Договор оказания услуг",
     "Пропуск": "Пропуск",
     "Коммунальные услуги": "Коммунальные услуги",
-    "Подписка на площадку": "Подписка на площадку (Premium и т.п.)",
-    "Прочее": "Прочие расходы",
 }
 
 
@@ -1126,7 +1146,6 @@ async def warehouse_expense_payment(update: Update, context: ContextTypes.DEFAUL
         kb2 = [
             ["Аренда склада", "Договор оказания услуг"],
             ["Пропуск", "Коммунальные услуги"],
-            ["Подписка на площадку", "Прочее"],
             ["🔙 Назад", "❌ Главное меню"],
         ]
         await update.message.reply_text("Шаг 1: Категория расхода:", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True))
@@ -1493,6 +1512,15 @@ async def warehouse_out_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             marketplace=d["w_marketplace"],
             note="",
         )
+        # Списание себестоимости сырья со склада — именно здесь товар физически уходит
+        cost_per_kg = db.get_material_cost_per_kg(item["product"])
+        if cost_per_kg and item["qty"]:
+            cogs = round(cost_per_kg * item["qty"], 2)
+            db.post_journal_entry(
+                operation_id=None, entry_date=move_date,
+                debit_code="5950", credit_code="1200",
+                amount=cogs, comment=f"Себестоимость отгрузки: {item['product']} {item['qty']}кг",
+            )
     n = len(d.get("w_items", []))
     _, total_qty = warehouse_cart_text(context)
     await update.message.reply_text(f"✅ Отгрузка зафиксирована: {n} поз., {total_qty} кг всего. Остаток на складе обновлён!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -1826,12 +1854,11 @@ async def emp_accrual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# --- ПРОДАЖА (выручка) ---
+# --- ПРОДАЖА (упрощённо — только реально поступившая сумма от площадки) ---
 async def sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     ips = db.get_my_ip_list()
-    context.user_data["sale_items"] = []
-    await update.message.reply_text("💵 *Новая продажа*\n\nШаг 1: Какое ИП продаёт?", reply_markup=build_grid_keyboard(ips, columns=2), parse_mode="Markdown")
+    await update.message.reply_text("💵 *Поступление от площадки*\n\nШаг 1: Какое ИП?", reply_markup=build_grid_keyboard(ips, columns=2), parse_mode="Markdown")
     return SALE_IP
 
 
@@ -1840,49 +1867,19 @@ async def show_sale_marketplace(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("Шаг 2: Какая площадка?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 
-async def show_sale_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data.get("db")
-    products = db.get_all_product_names()
-    n = len(context.user_data.get("sale_items", []))
-    label = f"Позиция №{n + 1}: какой товар продан?" if n else "Шаг 3: Какой товар продан?"
-    await update.message.reply_text(label, reply_markup=build_grid_keyboard(products, columns=2))
-
-
-async def show_sale_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"«{context.user_data['sale_cur_product']}» — фасовка (например «200г»):", reply_markup=get_step_keyboard())
-
-
-async def show_sale_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"«{context.user_data['sale_cur_product']}» ({context.user_data['sale_cur_packaging']}) — сколько штук продано?", reply_markup=get_step_keyboard())
-
-
-async def show_sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Цена за 1 штуку (₽):", reply_markup=get_step_keyboard())
-
-
-def sale_cart_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    items = context.user_data.get("sale_items", [])
-    lines = []
-    total = 0.0
-    for i, it in enumerate(items, 1):
-        subtotal = round(it["units"] * it["price"], 2)
-        lines.append(f"{i}. {it['product']} ({it['packaging']}) — {it['units']} шт × {it['price']} ₽ = {subtotal} ₽")
-        total += subtotal
-    return "\n".join(lines), round(total, 2)
-
-
-async def show_sale_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items_text, total = sale_cart_text(context)
-    kb = [["➕ Добавить ещё", "✅ Это всё"], ["🔙 Назад", "❌ Главное меню"]]
+async def show_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🧺 *Текущая продажа:*\n{items_text}\n\n💰 Итого (до комиссии): *{total} ₽*\n\nДобавить ещё позицию или завершить?",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown"
+        "Шаг 3: За какую дату/период поступление? Можно просто число (например 15) или Сегодня:",
+        reply_markup=ReplyKeyboardMarkup([["Сегодня"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True)
     )
 
 
-async def show_sale_commission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["15", "20"], ["Ввести вручную"], ["🔙 Назад", "❌ Главное меню"]]
-    await update.message.reply_text("Комиссия площадки, % (общая для всей продажи):", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+async def show_sale_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Шаг 4: Сколько реально поступило (₽), по отчёту площадки:", reply_markup=get_step_keyboard())
+
+
+async def show_sale_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Комментарий (например «за период 1-15 июля») или '-':", reply_markup=get_step_keyboard())
 
 
 async def sale_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1899,108 +1896,54 @@ async def sale_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад": return await sale_start(update, context)
     context.user_data["sale_marketplace"] = t
-    await show_sale_product(update, context)
-    return SALE_PRODUCT
+    await show_sale_date(update, context)
+    return SALE_PRODUCT  # переиспользуем состояние под ввод даты
 
 
 async def sale_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переиспользовано под ввод даты поступления (было — выбор товара в старой версии)."""
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
-        if context.user_data.get("sale_items"):
-            await show_sale_add_more(update, context)
-            return SALE_ADD_MORE
         await show_sale_marketplace(update, context)
         return SALE_MARKETPLACE
-    context.user_data["sale_cur_product"] = t
-    await show_sale_packaging(update, context)
-    return SALE_PACKAGING
+    parsed = parse_flexible_date(t, TZ_MSK)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не разобрал дату. Напишите число (15), 15.07, или Сегодня:")
+        return SALE_PRODUCT
+    context.user_data["sale_date_iso"], context.user_data["sale_date_display"] = parsed
+    await show_sale_amount(update, context)
+    return SALE_PACKAGING  # переиспользуем состояние под ввод суммы
 
 
 async def sale_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переиспользовано под ввод суммы поступления (было — фасовка в старой версии)."""
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
-        await show_sale_product(update, context)
+        await show_sale_date(update, context)
         return SALE_PRODUCT
-    context.user_data["sale_cur_packaging"] = t
-    await show_sale_units(update, context)
-    return SALE_UNITS
+    try: context.user_data["sale_amount"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return SALE_PACKAGING
+    await show_sale_comment(update, context)
+    return SALE_UNITS  # переиспользуем состояние под комментарий
 
 
 async def sale_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переиспользовано под комментарий (было — кол-во штук в старой версии)."""
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
-        await show_sale_packaging(update, context)
+        await show_sale_amount(update, context)
         return SALE_PACKAGING
-    try: context.user_data["sale_cur_units"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
-        return SALE_UNITS
-    await show_sale_price(update, context)
-    return SALE_PRICE
-
-
-async def sale_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await show_sale_units(update, context)
-        return SALE_UNITS
-    try: price = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
-        return SALE_PRICE
-
-    context.user_data.setdefault("sale_items", []).append({
-        "product": context.user_data["sale_cur_product"],
-        "packaging": context.user_data["sale_cur_packaging"],
-        "units": context.user_data["sale_cur_units"],
-        "price": price,
-    })
-    await show_sale_add_more(update, context)
-    return SALE_ADD_MORE
-
-
-async def sale_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        items = context.user_data.get("sale_items", [])
-        if items:
-            items.pop()
-        await show_sale_price(update, context)
-        return SALE_PRICE
-    if t == "➕ Добавить ещё":
-        await show_sale_product(update, context)
-        return SALE_PRODUCT
-    if t == "✅ Это всё":
-        await show_sale_commission(update, context)
-        return SALE_COMMISSION
-    return SALE_ADD_MORE
-
-
-async def sale_commission(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await show_sale_add_more(update, context)
-        return SALE_ADD_MORE
-    if t == "Ввести вручную":
-        await update.message.reply_text("Введите % комиссии числом:", reply_markup=get_step_keyboard())
-        return SALE_COMMISSION
-    try: commission = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Нужно ввести число, например 15. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
-        return SALE_COMMISSION
-
-    context.user_data["sale_commission"] = commission
-    items_text, total = sale_cart_text(context)
-    net = round(total * (1 - commission / 100), 2)
+    context.user_data["sale_comment"] = t if t != "-" else ""
+    d = context.user_data
     summary = (
-        f"💵 *Проверка продажи:*\n🏛 ИП: {context.user_data['sale_ip']}\n🛒 Площадка: {context.user_data['sale_marketplace']}\n\n"
-        f"{items_text}\n\n💰 Сумма до комиссии: {total} ₽\n📉 Комиссия: {commission}%\n💰 *К зачислению: {net} ₽*"
+        f"💵 *Поступление от площадки:*\n"
+        f"🏛 ИП: {d['sale_ip']}\n🛒 Площадка: {d['sale_marketplace']}\n"
+        f"📅 Дата: {d['sale_date_display']}\n💰 Сумма: {d['sale_amount']} ₽"
     )
     await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return SALE_CONFIRM
@@ -2009,45 +1952,32 @@ async def sale_commission(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sale_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "🔙 Назад":
-        await show_sale_commission(update, context)
-        return SALE_COMMISSION
+        await show_sale_comment(update, context)
+        return SALE_UNITS
     if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
 
     ip_id = db.get_ip_id(d["sale_ip"])
-    sale_date = datetime.now(TZ_MSK).date().isoformat()
-    commission = d["sale_commission"]
-
-    for item in d.get("sale_items", []):
-        gross = round(item["units"] * item["price"], 2)
-        net = round(gross * (1 - commission / 100), 2)
-        sale_id = db.add_sale(
-            sale_date=sale_date, ip_id=ip_id, marketplace=d["sale_marketplace"],
-            product_name=item["product"], packaging=item["packaging"],
-            units_sold=item["units"], price_per_unit=item["price"],
-            commission_pct=commission, gross_revenue=gross, net_revenue=net,
-            entered_by=str(update.effective_user.id),
-        )
-        # Двойная запись: Дт Дебиторка маркетплейса / Кт Выручка
-        db.post_journal_entry(
-            operation_id=None, entry_date=sale_date,
-            debit_code="1300", credit_code="6000",
-            amount=net, comment=f"Продажа: {item['product']} ({d['sale_marketplace']})",
-        )
-        # Списание себестоимости сырья со склада, если известна средняя цена
-        cost_per_kg = db.get_material_cost_per_kg(item["product"])
-        grams = parse_packaging_grams(item["packaging"])
-        if cost_per_kg and grams:
-            cogs = round(cost_per_kg * grams / 1000 * item["units"], 2)
-            db.post_journal_entry(
-                operation_id=None, entry_date=sale_date,
-                debit_code="5950", credit_code="1200",
-                amount=cogs, comment=f"Себестоимость: {item['product']} × {item['units']}",
-            )
-
-    _, total = sale_cart_text(context)
-    net_total = round(total * (1 - commission / 100), 2)
-    await update.message.reply_text(f"✅ Продажа внесена. К зачислению: {net_total} ₽.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    category_id = db.get_category_id("Продажа (доход)")
+    db.add_operation_returning_id(
+        operation_date=d["sale_date_iso"],
+        ip_id=ip_id,
+        counterparty_id=None,
+        category_id=category_id,
+        operation_type="поступление",
+        amount=d["sale_amount"],
+        entered_by=str(update.effective_user.id),
+        status="confirmed",
+        payment_method=None,
+        comment=f"{d['sale_marketplace']}: {d['sale_comment']}",
+    )
+    # Двойная запись: Дт Расчётный счёт / Кт Выручка — простая и честная, без оценок
+    db.post_journal_entry(
+        operation_id=None, entry_date=d["sale_date_iso"],
+        debit_code="1010", credit_code="6000",
+        amount=d["sale_amount"], comment=f"Поступление {d['sale_marketplace']}: {d['sale_comment']}",
+    )
+    await update.message.reply_text(f"✅ Поступление внесено: {d['sale_amount']} ₽ ({d['sale_marketplace']}).", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -2448,16 +2378,13 @@ def main():
     sale_conv = ConversationHandler(
         name="sale_conv",
         persistent=True,
-        entry_points=[MessageHandler(filters.Regex("^💵 Продажа$"), sale_start)],
+        entry_points=[MessageHandler(filters.Regex("^📥 Поступление$"), sale_start)],
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
             SALE_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_product)],
             SALE_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_packaging)],
             SALE_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_units)],
-            SALE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_price)],
-            SALE_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_add_more)],
-            SALE_COMMISSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_commission)],
             SALE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
@@ -2521,8 +2448,9 @@ def main():
     application.add_handler(history_conv)
     application.add_handler(warehouse_conv)
     application.add_handler(employee_conv)
-    application.add_handler(sale_conv)
-    application.add_handler(profit_conv)
+    # sale_conv и profit_conv временно отключены — раздел "Продажи/Прибыль" будет доработан отдельно
+    # application.add_handler(sale_conv)
+    # application.add_handler(profit_conv)
     application.add_handler(balance_conv)
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
