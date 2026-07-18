@@ -320,7 +320,7 @@ class SupabaseService:
         ops = (
             self.client.table("operations")
             .select("amount,category_id,operation_type,operation_date")
-            .in_("operation_type", ["покупка", "начисление"])
+            .in_("operation_type", ["покупка", "начисление", "расход"])
             .gte("operation_date", date_from)
             .lte("operation_date", date_to)
             .execute().data or []
@@ -394,12 +394,13 @@ def infer_category_name(counterparty_type: str) -> str:
     WAREHOUSE_MENU,
     WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
     WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_ADD_MORE, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM,
+    WAREHOUSE_EXPENSE_CATEGORY, WAREHOUSE_EXPENSE_PAYMENT, WAREHOUSE_EXPENSE_AMOUNT, WAREHOUSE_EXPENSE_COMMENT, WAREHOUSE_EXPENSE_CONFIRM,
     EMPLOYEE_MENU,
     EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM, EMP_SHIFT_NEXT,
     EMP_ACCRUAL_EMPLOYEE, EMP_ACCRUAL_AMOUNT, EMP_ACCRUAL_COMMENT, EMP_ACCRUAL_CONFIRM,
     SALE_IP, SALE_MARKETPLACE, SALE_PRODUCT, SALE_PACKAGING, SALE_UNITS, SALE_PRICE, SALE_ADD_MORE, SALE_COMMISSION, SALE_CONFIRM,
     PROFIT_MODE, PROFIT_PRODUCT, PROFIT_PACKAGING, PROFIT_MARKETPLACE, PROFIT_PERIOD, PROFIT_PERIOD_CUSTOM
-) = range(75)
+) = range(80)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -1057,7 +1058,7 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
 
 # --- WAREHOUSE (СКЛАД) ---
 async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["❌ Главное меню"]]
+    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы"], ["❌ Главное меню"]]
     await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_MENU
 
@@ -1083,7 +1084,120 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
         return ConversationHandler.END
 
+    elif t == "💸 Постоянные расходы":
+        kb2 = [
+            ["Аренда склада", "Договор оказания услуг"],
+            ["Пропуск", "Коммунальные услуги"],
+            ["Подписка на площадку", "Прочее"],
+            ["🔙 Назад", "❌ Главное меню"],
+        ]
+        await update.message.reply_text("Шаг 1: Категория расхода:", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True))
+        return WAREHOUSE_EXPENSE_CATEGORY
+
     return WAREHOUSE_MENU
+
+
+WAREHOUSE_EXPENSE_CATEGORY_MAP = {
+    "Аренда склада": "Аренда склада",
+    "Договор оказания услуг": "Договор оказания услуг",
+    "Пропуск": "Пропуск",
+    "Коммунальные услуги": "Коммунальные услуги",
+    "Подписка на площадку": "Подписка на площадку (Premium и т.п.)",
+    "Прочее": "Прочие расходы",
+}
+
+
+async def warehouse_expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await warehouse_start(update, context)
+    if t not in WAREHOUSE_EXPENSE_CATEGORY_MAP: return WAREHOUSE_EXPENSE_CATEGORY
+    context.user_data["wexp_category_label"] = t
+    context.user_data["wexp_category_name"] = WAREHOUSE_EXPENSE_CATEGORY_MAP[t]
+    kb = [["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text("Шаг 2: Способ оплаты:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return WAREHOUSE_EXPENSE_PAYMENT
+
+
+async def warehouse_expense_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        kb2 = [
+            ["Аренда склада", "Договор оказания услуг"],
+            ["Пропуск", "Коммунальные услуги"],
+            ["Подписка на площадку", "Прочее"],
+            ["🔙 Назад", "❌ Главное меню"],
+        ]
+        await update.message.reply_text("Шаг 1: Категория расхода:", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True))
+        return WAREHOUSE_EXPENSE_CATEGORY
+    context.user_data["wexp_payment"] = t
+    await update.message.reply_text("Шаг 3: Сумма (₽):", reply_markup=get_step_keyboard())
+    return WAREHOUSE_EXPENSE_AMOUNT
+
+
+async def warehouse_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        kb = [["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("Шаг 2: Способ оплаты:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return WAREHOUSE_EXPENSE_PAYMENT
+    try: context.user_data["wexp_amount"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return WAREHOUSE_EXPENSE_AMOUNT
+    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+    return WAREHOUSE_EXPENSE_COMMENT
+
+
+async def warehouse_expense_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await update.message.reply_text("Шаг 3: Сумма (₽):", reply_markup=get_step_keyboard())
+        return WAREHOUSE_EXPENSE_AMOUNT
+    context.user_data["wexp_comment"] = t if t != "-" else ""
+    d = context.user_data
+    summary = f"💸 *Постоянный расход:*\n📂 Категория: {d['wexp_category_label']}\n💳 Оплата: {d['wexp_payment']}\n💰 Сумма: {d['wexp_amount']} ₽"
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    return WAREHOUSE_EXPENSE_CONFIRM
+
+
+async def warehouse_expense_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await warehouse_expense_comment_back(update, context)
+        return WAREHOUSE_EXPENSE_COMMENT
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data.get("db"), context.user_data
+    op_date = datetime.now(TZ_MSK).date().isoformat()
+
+    category_id = db.get_category_id(d["wexp_category_name"])
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date,
+        ip_id=None,
+        counterparty_id=None,
+        category_id=category_id,
+        operation_type="расход",
+        amount=d["wexp_amount"],
+        entered_by=str(update.effective_user.id),
+        status="confirmed",
+        payment_method=d["wexp_payment"],
+        comment=d["wexp_comment"],
+    )
+    cash_code = "1000" if d["wexp_payment"] == "Наличные" else "1010"
+    db.post_journal_entry(
+        operation_id=op_id, entry_date=op_date,
+        debit_code="5900", credit_code=cash_code,
+        amount=d["wexp_amount"], comment=f"{d['wexp_category_label']}: {d['wexp_comment']}",
+    )
+    await update.message.reply_text("✅ Расход внесён.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+async def warehouse_expense_comment_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
 
 
 # --- Приход сырья ---
@@ -2304,6 +2418,11 @@ def main():
             WAREHOUSE_OUT_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_add_more)],
             WAREHOUSE_OUT_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_marketplace)],
             WAREHOUSE_OUT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_confirm)],
+            WAREHOUSE_EXPENSE_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_category)],
+            WAREHOUSE_EXPENSE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_payment)],
+            WAREHOUSE_EXPENSE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_amount)],
+            WAREHOUSE_EXPENSE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_comment)],
+            WAREHOUSE_EXPENSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
 
