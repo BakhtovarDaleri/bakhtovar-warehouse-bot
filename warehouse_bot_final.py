@@ -179,6 +179,34 @@ class SupabaseService:
         )
         return res.data or []
 
+    def get_all_debts(self):
+        """Баланс по каждому контрагенту сразу — для сводного отчёта по всем долгам."""
+        ops = self.client.table("operations").select("counterparty_id,amount").execute().data or []
+        sums = {}
+        for r in ops:
+            cid = r.get("counterparty_id")
+            if cid is None:
+                continue
+            sums[cid] = sums.get(cid, 0.0) + float(r["amount"])
+
+        nonzero_ids = [cid for cid, total in sums.items() if abs(total) >= 0.01]
+        if not nonzero_ids:
+            return []
+
+        cps = self.client.table("counterparties").select("id,name,type").in_("id", nonzero_ids).execute().data or []
+        cp_map = {c["id"]: c for c in cps}
+
+        result = []
+        for cid in nonzero_ids:
+            cp = cp_map.get(cid, {})
+            result.append({
+                "name": cp.get("name", "?"),
+                "type": cp.get("type", ""),
+                "balance": round(sums[cid], 2),
+            })
+        result.sort(key=lambda x: -abs(x["balance"]))
+        return result
+
     def get_hourly_employees(self):
         """Сотрудники с почасовой ставкой (для учёта смен)."""
         res = self.client.table("counterparties").select("id,name,hourly_rate").eq("type", "сотрудник").not_.is_("hourly_rate", "null").order("name").execute()
@@ -225,7 +253,7 @@ def infer_category_name(counterparty_type: str) -> str:
     ADD_SELECT, ADD_SUPPLIER_PHONE, ADD_SUPPLIER_NAME, ADD_SUPPLIER_TYPE, ADD_SUPPLIER_CONFIRM,
     ADD_MY_IP_NAME, ADD_MY_IP_CONFIRM, ADD_PRODUCT_NAME, ADD_PRODUCT_IP,
     REMINDER_TYPE_SELECT, REMINDER_INPUT_FLOW, REMINDER_DATE_SELECT, REMINDER_TIME_SELECT,
-    BALANCE_SUPPLIER,
+    BALANCE_SUPPLIER, BALANCE_MODE,
     HISTORY_CATEGORY, HISTORY_SUPPLIER,
     WAREHOUSE_MENU,
     WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
@@ -233,7 +261,7 @@ def infer_category_name(counterparty_type: str) -> str:
     EMPLOYEE_MENU,
     EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM, EMP_SHIFT_NEXT,
     EMP_ACCRUAL_EMPLOYEE, EMP_ACCRUAL_AMOUNT, EMP_ACCRUAL_COMMENT, EMP_ACCRUAL_CONFIRM
-) = range(55)
+) = range(56)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -669,14 +697,45 @@ async def payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BALANCE LOGIC ---
 async def balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sups = [s["name"] for s in context.bot_data.get("db").get_suppliers_list()]
-    await update.message.reply_text("📊 Выберите контрагента для вывода точного баланса:", reply_markup=build_grid_keyboard(sups, columns=2))
-    return BALANCE_SUPPLIER
+    kb = [["🔍 Один контрагент", "📋 Все долги"], ["❌ Главное меню"]]
+    await update.message.reply_text("📊 *Баланс*\n\nЧто показать?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    return BALANCE_MODE
+
+
+async def balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
+    db = context.bot_data.get("db")
+
+    if t == "🔍 Один контрагент":
+        sups = [s["name"] for s in db.get_suppliers_list()]
+        await update.message.reply_text("Выберите контрагента для вывода точного баланса:", reply_markup=build_grid_keyboard(sups, columns=2))
+        return BALANCE_SUPPLIER
+
+    elif t == "📋 Все долги":
+        debts = db.get_all_debts()
+        if not debts:
+            await update.message.reply_text("Долгов нет — все балансы на нуле.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+
+        type_icons = {"поставщик сырья": "🌰", "поставщик расходников": "📦", "сотрудник": "👤"}
+        lines = ["📋 *Все текущие долги:*\n"]
+        grand_total = 0.0
+        for d in debts:
+            icon = type_icons.get(d["type"], "▫️")
+            lines.append(f"{icon} {d['name']}: *{d['balance']} ₽*")
+            grand_total += d["balance"]
+        lines.append(f"\n💰 *Итого по всем контрагентам: {round(grand_total, 2)} ₽*")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+        return ConversationHandler.END
+
+    return BALANCE_MODE
 
 
 async def balance_calculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await balance_start(update, context)
     debt = context.bot_data.get("db").get_supplier_current_debt(t)
     await update.message.reply_text(f"📊 Контрагент: `{t}`\n💰 Текущий баланс долга: *{debt}* ₽", reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
     return ConversationHandler.END
@@ -1502,7 +1561,10 @@ def main():
 
     balance_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start)],
-        states={BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)]},
+        states={
+            BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
+            BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
+        },
         fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
 
