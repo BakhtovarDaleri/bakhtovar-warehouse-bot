@@ -257,11 +257,11 @@ def infer_category_name(counterparty_type: str) -> str:
     HISTORY_CATEGORY, HISTORY_SUPPLIER,
     WAREHOUSE_MENU,
     WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
-    WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM,
+    WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_ADD_MORE, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM,
     EMPLOYEE_MENU,
     EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM, EMP_SHIFT_NEXT,
     EMP_ACCRUAL_EMPLOYEE, EMP_ACCRUAL_AMOUNT, EMP_ACCRUAL_COMMENT, EMP_ACCRUAL_CONFIRM
-) = range(56)
+) = range(57)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -917,7 +917,7 @@ async def warehouse_in_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-# --- Фасовка / Отгрузка ---
+# --- Фасовка / Отгрузка (одна отгрузка — несколько позиций) ---
 async def show_warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     ips = db.get_my_ip_list()
@@ -927,20 +927,41 @@ async def show_warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TY
 async def show_warehouse_out_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     products = db.get_all_product_names()
-    await update.message.reply_text("Шаг 2: Какой товар фасуем?", reply_markup=build_grid_keyboard(products, columns=2))
+    n = len(context.user_data.get("w_items", []))
+    label = f"Позиция №{n + 1}: какой товар фасуем?" if n else "Шаг 2: Какой товар фасуем?"
+    await update.message.reply_text(label, reply_markup=build_grid_keyboard(products, columns=2))
 
 
 async def show_warehouse_out_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 3: Фасовка (например «200г»):", reply_markup=get_step_keyboard())
+    await update.message.reply_text(f"«{context.user_data['w_cur_product']}» — фасовка (например «200г»):", reply_markup=get_step_keyboard())
 
 
 async def show_warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 4: Сколько кг всего отгружаем?", reply_markup=get_step_keyboard())
+    await update.message.reply_text(f"«{context.user_data['w_cur_product']}» ({context.user_data['w_cur_packaging']}) — сколько кг?", reply_markup=get_step_keyboard())
+
+
+def warehouse_cart_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    items = context.user_data.get("w_items", [])
+    lines = []
+    total_qty = 0.0
+    for i, it in enumerate(items, 1):
+        lines.append(f"{i}. {it['product']} ({it['packaging']}) — {it['qty']} кг")
+        total_qty += it["qty"]
+    return "\n".join(lines), round(total_qty, 2)
+
+
+async def show_warehouse_out_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    items_text, total_qty = warehouse_cart_text(context)
+    kb = [["➕ Добавить ещё", "✅ Это всё"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text(
+        f"📦 *Текущая отгрузка:*\n{items_text}\n\n⚖️ Всего: *{total_qty} кг*\n\nДобавить ещё позицию или завершить?",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown"
+    )
 
 
 async def show_warehouse_out_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [["Ozon", "WB"], ["Яндекс"], ["🔙 Назад", "❌ Главное меню"]]
-    await update.message.reply_text("Шаг 5: Куда отгружаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    await update.message.reply_text("Куда отгружаем (общая площадка для всей партии)?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 
 async def warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -948,6 +969,7 @@ async def warehouse_out_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад": return await warehouse_start(update, context)
     context.user_data["w_ip"] = t
+    context.user_data["w_items"] = []
     await show_warehouse_out_product(update, context)
     return WAREHOUSE_OUT_PRODUCT
 
@@ -956,9 +978,12 @@ async def warehouse_out_product(update: Update, context: ContextTypes.DEFAULT_TY
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
+        if context.user_data.get("w_items"):
+            await show_warehouse_out_add_more(update, context)
+            return WAREHOUSE_OUT_ADD_MORE
         await show_warehouse_out_ip(update, context)
         return WAREHOUSE_OUT_IP
-    context.user_data["w_product"] = t
+    context.user_data["w_cur_product"] = t
     await show_warehouse_out_packaging(update, context)
     return WAREHOUSE_OUT_PACKAGING
 
@@ -969,7 +994,7 @@ async def warehouse_out_packaging(update: Update, context: ContextTypes.DEFAULT_
     if t == "🔙 Назад":
         await show_warehouse_out_product(update, context)
         return WAREHOUSE_OUT_PRODUCT
-    context.user_data["w_packaging"] = t
+    context.user_data["w_cur_packaging"] = t
     await show_warehouse_out_qty(update, context)
     return WAREHOUSE_OUT_QTY
 
@@ -980,23 +1005,48 @@ async def warehouse_out_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "🔙 Назад":
         await show_warehouse_out_packaging(update, context)
         return WAREHOUSE_OUT_PACKAGING
-    try: context.user_data["w_qty"] = float(t.replace(",", ".").replace(" ", ""))
+    try: qty = float(t.replace(",", ".").replace(" ", ""))
     except ValueError:
         await update.message.reply_text("⚠️ Нужно ввести число, например 200. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
         return WAREHOUSE_OUT_QTY
-    await show_warehouse_out_marketplace(update, context)
-    return WAREHOUSE_OUT_MARKETPLACE
+
+    context.user_data.setdefault("w_items", []).append({
+        "product": context.user_data["w_cur_product"],
+        "packaging": context.user_data["w_cur_packaging"],
+        "qty": qty,
+    })
+    await show_warehouse_out_add_more(update, context)
+    return WAREHOUSE_OUT_ADD_MORE
+
+
+async def warehouse_out_add_more(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        items = context.user_data.get("w_items", [])
+        if items:
+            items.pop()
+        await show_warehouse_out_qty(update, context)
+        return WAREHOUSE_OUT_QTY
+    if t == "➕ Добавить ещё":
+        await show_warehouse_out_product(update, context)
+        return WAREHOUSE_OUT_PRODUCT
+    if t == "✅ Это всё":
+        await show_warehouse_out_marketplace(update, context)
+        return WAREHOUSE_OUT_MARKETPLACE
+    return WAREHOUSE_OUT_ADD_MORE
 
 
 async def warehouse_out_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
-        await show_warehouse_out_qty(update, context)
-        return WAREHOUSE_OUT_QTY
+        await show_warehouse_out_add_more(update, context)
+        return WAREHOUSE_OUT_ADD_MORE
     context.user_data["w_marketplace"] = t
     d = context.user_data
-    summary = f"📤 *Фасовка/Отгрузка:*\n🏛 ИП: {d['w_ip']}\n📦 Товар: {d['w_product']} ({d['w_packaging']})\n⚖️ Вес: {d['w_qty']} кг\n🛒 Площадка: {t}"
+    items_text, total_qty = warehouse_cart_text(context)
+    summary = f"📤 *Проверка отгрузки:*\n🏛 ИП: {d['w_ip']}\n\n{items_text}\n\n⚖️ Всего: *{total_qty} кг*\n🛒 Площадка: {t}"
     await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_OUT_CONFIRM
 
@@ -1008,20 +1058,26 @@ async def warehouse_out_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         return WAREHOUSE_OUT_MARKETPLACE
     if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
     db, d = context.bot_data.get("db"), context.user_data
-    db.add_warehouse_movement(
-        direction="расход",
-        flow_type="отгрузка_маркетплейс",
-        product_name=d["w_product"],
-        packaging=d["w_packaging"],
-        quantity=d["w_qty"],
-        unit="кг",
-        movement_date=datetime.now(TZ_MSK).date().isoformat(),
-        counterparty_id=None,
-        ip_id=db.get_ip_id(d["w_ip"]),
-        marketplace=d["w_marketplace"],
-        note="",
-    )
-    await update.message.reply_text("✅ Отгрузка зафиксирована, остаток на складе обновлён!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+
+    ip_id = db.get_ip_id(d["w_ip"])
+    move_date = datetime.now(TZ_MSK).date().isoformat()
+    for item in d.get("w_items", []):
+        db.add_warehouse_movement(
+            direction="расход",
+            flow_type="отгрузка_маркетплейс",
+            product_name=item["product"],
+            packaging=item["packaging"],
+            quantity=item["qty"],
+            unit="кг",
+            movement_date=move_date,
+            counterparty_id=None,
+            ip_id=ip_id,
+            marketplace=d["w_marketplace"],
+            note="",
+        )
+    n = len(d.get("w_items", []))
+    _, total_qty = warehouse_cart_text(context)
+    await update.message.reply_text(f"✅ Отгрузка зафиксирована: {n} поз., {total_qty} кг всего. Остаток на складе обновлён!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
@@ -1537,6 +1593,7 @@ def main():
             WAREHOUSE_OUT_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_product)],
             WAREHOUSE_OUT_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_packaging)],
             WAREHOUSE_OUT_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_qty)],
+            WAREHOUSE_OUT_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_add_more)],
             WAREHOUSE_OUT_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_marketplace)],
             WAREHOUSE_OUT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
