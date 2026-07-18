@@ -165,6 +165,13 @@ class SupabaseService:
     def add_operation(self, **fields):
         self.client.table("operations").insert(fields).execute()
 
+    def add_operation_returning_id(self, **fields):
+        res = self.client.table("operations").insert(fields).execute()
+        return res.data[0]["id"]
+
+    def mark_operation_reversed(self, original_id: int, reversal_id: int):
+        self.client.table("operations").update({"reversed_by": reversal_id}).eq("id", original_id).execute()
+
     def add_counterparty(self, name: str, phone: str = None, type_: str = "поставщик сырья"):
         self.client.table("counterparties").insert({"name": name, "phone": phone, "type": type_}).execute()
 
@@ -256,14 +263,14 @@ def infer_category_name(counterparty_type: str) -> str:
     ADD_MY_IP_NAME, ADD_MY_IP_CONFIRM, ADD_PRODUCT_NAME, ADD_PRODUCT_IP,
     REMINDER_TYPE_SELECT, REMINDER_INPUT_FLOW, REMINDER_DATE_SELECT, REMINDER_TIME_SELECT,
     BALANCE_SUPPLIER, BALANCE_MODE,
-    HISTORY_CATEGORY, HISTORY_SUPPLIER,
+    HISTORY_CATEGORY, HISTORY_SUPPLIER, HISTORY_REVERSE_SELECT, HISTORY_REVERSE_NUMBER, HISTORY_REVERSE_CONFIRM,
     WAREHOUSE_MENU,
     WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
     WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_ADD_MORE, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM,
     EMPLOYEE_MENU,
     EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM, EMP_SHIFT_NEXT,
     EMP_ACCRUAL_EMPLOYEE, EMP_ACCRUAL_AMOUNT, EMP_ACCRUAL_COMMENT, EMP_ACCRUAL_CONFIRM
-) = range(57)
+) = range(60)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -782,17 +789,94 @@ async def history_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📜 История по «{t}» пуста.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return ConversationHandler.END
 
+    context.user_data["history_rows"] = rows
+    context.user_data["history_name"] = t
+
     running = 0.0
     lines = [f"📜 *История: {t}*\n"]
-    for r in rows:
+    for i, r in enumerate(rows, 1):
         running += float(r["amount"])
         sign = "➕" if float(r["amount"]) >= 0 else "➖"
         item = r.get("item_name") or ""
-        lines.append(f"{sign} {r.get('operation_date','')} | {r.get('operation_type','')} {item} | {r['amount']} ₽ | итог: {round(running,2)} ₽")
+        reversed_tag = " ↩️сторно" if r.get("reversed_by") else ""
+        lines.append(f"{i}. {sign} {r.get('operation_date','')} | {r.get('operation_type','')} {item} | {r['amount']} ₽ | итог: {round(running,2)} ₽{reversed_tag}")
 
-    text = "\n".join(lines[:1] + lines[-20:]) if len(lines) > 21 else "\n".join(lines)
+    text = "\n".join([lines[0]] + lines[-20:]) if len(lines) > 21 else "\n".join(lines)
     text += f"\n\n💰 *Текущий остаток долга: {round(running,2)} ₽*"
-    await update.message.reply_text(text, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    kb = [["↩️ Отменить операцию"], ["❌ Главное меню"]]
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    return HISTORY_REVERSE_SELECT
+
+
+async def history_reverse_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t != "↩️ Отменить операцию":
+        return await cancel_to_menu(update, context)
+    await update.message.reply_text(
+        "Введите номер операции для отмены (число из списка выше):",
+        reply_markup=ReplyKeyboardMarkup([["❌ Главное меню"]], resize_keyboard=True)
+    )
+    return HISTORY_REVERSE_NUMBER
+
+
+async def history_reverse_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    rows = context.user_data.get("history_rows", [])
+    try:
+        idx = int(t) - 1
+        if idx < 0 or idx >= len(rows):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(f"⚠️ Введите число от 1 до {len(rows)}:")
+        return HISTORY_REVERSE_NUMBER
+
+    row = rows[idx]
+    if row.get("reversed_by"):
+        await update.message.reply_text("⚠️ Эта операция уже отменена ранее.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+
+    context.user_data["reverse_target"] = row
+    item = row.get("item_name") or ""
+    summary = (
+        f"↩️ *Подтвердите отмену операции:*\n"
+        f"{row.get('operation_date','')} | {row.get('operation_type','')} {item} | {row['amount']} ₽\n\n"
+        f"Будет создана компенсирующая запись на {-float(row['amount'])} ₽."
+    )
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить отмену"], ["❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    return HISTORY_REVERSE_CONFIRM
+
+
+async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t != "✅ Подтвердить отмену": return await cancel_to_menu(update, context)
+    db = context.bot_data.get("db")
+    row = context.user_data["reverse_target"]
+
+    reversal_id = db.add_operation_returning_id(
+        operation_date=datetime.now(TZ_MSK).date().isoformat(),
+        ip_id=row.get("ip_id"),
+        counterparty_id=row.get("counterparty_id"),
+        category_id=row.get("category_id"),
+        operation_type="сторно",
+        amount=-float(row["amount"]),
+        quantity=row.get("quantity"),
+        price=row.get("price"),
+        item_name=row.get("item_name"),
+        entered_by=str(update.effective_user.id),
+        status="confirmed",
+        payment_method=row.get("payment_method"),
+        comment=f"Сторно операции №{row['id']}",
+        reversal_of=row["id"],
+    )
+    db.mark_operation_reversed(row["id"], reversal_id)
+
+    await update.message.reply_text(
+        f"✅ Операция отменена. Создана компенсирующая запись на {-float(row['amount'])} ₽.\n"
+        f"Исходная запись осталась в истории (не удалена).",
+        reply_markup=get_main_menu_keyboard(update.effective_user.id)
+    )
     return ConversationHandler.END
 
 
@@ -1643,6 +1727,9 @@ def main():
         states={
             HISTORY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_category)],
             HISTORY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_supplier)],
+            HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
+            HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
+            HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
 
