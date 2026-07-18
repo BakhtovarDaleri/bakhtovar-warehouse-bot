@@ -231,9 +231,9 @@ def infer_category_name(counterparty_type: str) -> str:
     WAREHOUSE_IN_SUPPLIER, WAREHOUSE_IN_PRODUCT, WAREHOUSE_IN_QTY, WAREHOUSE_IN_COMMENT, WAREHOUSE_IN_CONFIRM,
     WAREHOUSE_OUT_IP, WAREHOUSE_OUT_PRODUCT, WAREHOUSE_OUT_PACKAGING, WAREHOUSE_OUT_QTY, WAREHOUSE_OUT_MARKETPLACE, WAREHOUSE_OUT_CONFIRM,
     EMPLOYEE_MENU,
-    EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM,
+    EMP_SHIFT_EMPLOYEE, EMP_SHIFT_DATE, EMP_SHIFT_START, EMP_SHIFT_END, EMP_SHIFT_CONFIRM, EMP_SHIFT_NEXT,
     EMP_ACCRUAL_EMPLOYEE, EMP_ACCRUAL_AMOUNT, EMP_ACCRUAL_COMMENT, EMP_ACCRUAL_CONFIRM
-) = range(54)
+) = range(55)
 
 
 # --- SMART GRID KEYBOARD BUILDER ---
@@ -737,7 +737,7 @@ async def history_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- WAREHOUSE (СКЛАД) ---
 async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["📥 Приход сырья", "📤 Фасовка/Отгрузка"], ["📊 Остаток на складе"], ["❌ Главное меню"]]
+    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["❌ Главное меню"]]
     await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_MENU
 
@@ -747,12 +747,7 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
 
-    if t == "📥 Приход сырья":
-        sups = [s["name"] for s in db.get_suppliers_list(type_filter="поставщик сырья")]
-        await update.message.reply_text("Шаг 1: От какого поставщика пришёл товар?", reply_markup=build_grid_keyboard(sups, columns=2))
-        return WAREHOUSE_IN_SUPPLIER
-
-    elif t == "📤 Фасовка/Отгрузка":
+    if t == "📤 Фасовка/Отгрузка":
         ips = db.get_my_ip_list()
         await update.message.reply_text("Шаг 1: На какое ИП фасуем и отгружаем?", reply_markup=build_grid_keyboard(ips, columns=2))
         return WAREHOUSE_OUT_IP
@@ -971,6 +966,58 @@ async def warehouse_out_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+def parse_flexible_date(text: str, tz):
+    """Принимает 'Сегодня', 'Вчера', '15', '15.07' или '15.07.2026'. Возвращает (iso_date, display) или None."""
+    raw = text.strip().lower()
+    now = datetime.now(tz)
+    if raw == "сегодня":
+        d = now.date()
+        return d.isoformat(), d.strftime("%d.%m.%Y")
+    if raw == "вчера":
+        d = (now - timedelta(days=1)).date()
+        return d.isoformat(), d.strftime("%d.%m.%Y")
+
+    parts = text.strip().replace(" ", "").split(".")
+    try:
+        if len(parts) == 1 and parts[0].isdigit():
+            d = now.date().replace(day=int(parts[0]))
+        elif len(parts) == 2 and all(p.isdigit() for p in parts):
+            d = now.date().replace(day=int(parts[0]), month=int(parts[1]))
+        elif len(parts) == 3 and all(p.isdigit() for p in parts):
+            year = int(parts[2])
+            if year < 100: year += 2000
+            d = now.date().replace(day=int(parts[0]), month=int(parts[1]), year=year)
+        else:
+            return None
+    except ValueError:
+        return None
+    return d.isoformat(), d.strftime("%d.%m.%Y")
+
+
+def parse_flexible_time(text: str):
+    """Принимает '9', '09', '900', '0900', '09:00'. Возвращает 'ЧЧ:ММ' или None."""
+    raw = text.strip().replace(" ", "")
+    if ":" in raw:
+        try:
+            datetime.strptime(raw, "%H:%M")
+            return raw
+        except ValueError:
+            return None
+    if not raw.isdigit():
+        return None
+    if len(raw) <= 2:
+        h, m = int(raw), 0
+    elif len(raw) == 3:
+        h, m = int(raw[0]), int(raw[1:3])
+    elif len(raw) == 4:
+        h, m = int(raw[0:2]), int(raw[2:4])
+    else:
+        return None
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return None
+    return f"{h:02d}:{m:02d}"
+
+
 # --- EMPLOYEES (СОТРУДНИКИ) ---
 async def employee_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [["🕐 Внести смену", "💵 Начислить оклад"], ["❌ Главное меню"]]
@@ -1002,18 +1049,21 @@ async def employee_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Внести смену (почасовые) ---
 async def show_emp_shift_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t_now = datetime.now(TZ_MSK)
-    d0 = t_now.strftime("%d.%m.%Y")
-    d1 = (t_now - timedelta(days=1)).strftime("%d.%m.%Y")
-    kb = [[f"Сегодня ({d0})", f"Вчера ({d1})"], ["Свой вариант даты"], ["🔙 Назад", "❌ Главное меню"]]
-    await update.message.reply_text("Шаг 2: За какой день смена?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    d0 = t_now.strftime("%d.%m")
+    d1 = (t_now - timedelta(days=1)).strftime("%d.%m")
+    kb = [[f"Сегодня ({d0})", f"Вчера ({d1})"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text(
+        "Шаг 2: За какой день смена?\nМожно нажать кнопку, или просто написать число (напр. `15` или `15.07`):",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown"
+    )
 
 
 async def show_emp_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 3: Время начала смены (например 09:00):", reply_markup=get_step_keyboard())
+    await update.message.reply_text("Шаг 3: Время начала смены — просто цифрами, например `9` или `900` (=09:00):", reply_markup=get_step_keyboard(), parse_mode="Markdown")
 
 
 async def show_emp_shift_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 4: Время окончания смены (например 21:00):", reply_markup=get_step_keyboard())
+    await update.message.reply_text("Шаг 4: Время окончания — например `21` или `2100` (=21:00):", reply_markup=get_step_keyboard(), parse_mode="Markdown")
 
 
 async def emp_shift_employee(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1040,10 +1090,13 @@ async def emp_shift_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emps = [e["name"] for e in db.get_hourly_employees()]
         await update.message.reply_text("Шаг 1: Выберите сотрудника:", reply_markup=build_grid_keyboard(emps, columns=2))
         return EMP_SHIFT_EMPLOYEE
-    if "Сегодня" in t or "Вчера" in t:
-        context.user_data["emp_date"] = t.split("(")[1].replace(")", "").strip()
-    else:
-        context.user_data["emp_date"] = t
+
+    raw = t.split("(")[0].strip() if "(" in t else t
+    parsed = parse_flexible_date(raw, TZ_MSK)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не разобрал дату. Напишите число (например 15), 15.07, или нажмите Сегодня/Вчера:", reply_markup=get_step_keyboard())
+        return EMP_SHIFT_DATE
+    context.user_data["emp_date_iso"], context.user_data["emp_date"] = parsed
     await show_emp_shift_start(update, context)
     return EMP_SHIFT_START
 
@@ -1054,12 +1107,11 @@ async def emp_shift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "🔙 Назад":
         await show_emp_shift_date(update, context)
         return EMP_SHIFT_DATE
-    try:
-        datetime.strptime(t, "%H:%M")
-    except ValueError:
-        await update.message.reply_text("⚠️ Формат времени ЧЧ:ММ, например 09:00. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+    parsed = parse_flexible_time(t)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не понял время. Просто цифрами: 9, 09 или 900. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
         return EMP_SHIFT_START
-    context.user_data["emp_start"] = t
+    context.user_data["emp_start"] = parsed
     await show_emp_shift_end(update, context)
     return EMP_SHIFT_END
 
@@ -1070,13 +1122,13 @@ async def emp_shift_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "🔙 Назад":
         await show_emp_shift_start(update, context)
         return EMP_SHIFT_START
-    try:
-        t_start = datetime.strptime(context.user_data["emp_start"], "%H:%M")
-        t_end = datetime.strptime(t, "%H:%M")
-    except ValueError:
-        await update.message.reply_text("⚠️ Формат времени ЧЧ:ММ, например 21:00. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+    parsed = parse_flexible_time(t)
+    if not parsed:
+        await update.message.reply_text("⚠️ Не понял время. Просто цифрами: 21 или 2100. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
         return EMP_SHIFT_END
 
+    t_start = datetime.strptime(context.user_data["emp_start"], "%H:%M")
+    t_end = datetime.strptime(parsed, "%H:%M")
     hours = (t_end - t_start).total_seconds() / 3600
     if hours <= 0:
         hours += 24  # смена через полночь
@@ -1086,7 +1138,7 @@ async def emp_shift_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pay = round(hours * rate, 2)
     total = round(pay + meal, 2)
 
-    context.user_data["emp_end"] = t
+    context.user_data["emp_end"] = parsed
     context.user_data["emp_hours"] = round(hours, 2)
     context.user_data["emp_pay"] = pay
     context.user_data["emp_meal"] = meal
@@ -1116,7 +1168,7 @@ async def emp_shift_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     category_id = db.get_category_id("Зарплата")
     comment = f"Смена {d['emp_date']} {d['emp_start']}–{d['emp_end']} ({d['emp_hours']}ч)"
     db.add_operation(
-        operation_date=datetime.now(TZ_MSK).date().isoformat(),
+        operation_date=d["emp_date_iso"],
         ip_id=None,
         counterparty_id=d["emp_id"],
         category_id=category_id,
@@ -1127,8 +1179,25 @@ async def emp_shift_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_method=None,
         comment=comment,
     )
-    await update.message.reply_text(f"✅ Смена внесена, начислено {d['emp_total']} ₽ для {d['emp_name']}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-    return ConversationHandler.END
+    kb = [["➕ Ещё смена (этот сотрудник)"], ["👤 Другой сотрудник", "✅ Готово"]]
+    await update.message.reply_text(
+        f"✅ Смена внесена, начислено {d['emp_total']} ₽ для {d['emp_name']}.\nВнести ещё одну смену?",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
+    return EMP_SHIFT_NEXT
+
+
+async def emp_shift_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    db = context.bot_data.get("db")
+    if t == "➕ Ещё смена (этот сотрудник)":
+        await show_emp_shift_date(update, context)
+        return EMP_SHIFT_DATE
+    if t == "👤 Другой сотрудник":
+        emps = [e["name"] for e in db.get_hourly_employees()]
+        await update.message.reply_text("Шаг 1: Выберите сотрудника:", reply_markup=build_grid_keyboard(emps, columns=2))
+        return EMP_SHIFT_EMPLOYEE
+    return await cancel_to_menu(update, context)
 
 
 # --- Начислить оклад (фиксированная зарплата) ---
@@ -1405,11 +1474,6 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start)],
         states={
             WAREHOUSE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_menu)],
-            WAREHOUSE_IN_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_supplier)],
-            WAREHOUSE_IN_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_product)],
-            WAREHOUSE_IN_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_qty)],
-            WAREHOUSE_IN_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_comment)],
-            WAREHOUSE_IN_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_in_confirm)],
             WAREHOUSE_OUT_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_ip)],
             WAREHOUSE_OUT_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_product)],
             WAREHOUSE_OUT_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_packaging)],
@@ -1428,6 +1492,7 @@ def main():
             EMP_SHIFT_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_start)],
             EMP_SHIFT_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_end)],
             EMP_SHIFT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_confirm)],
+            EMP_SHIFT_NEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_next)],
             EMP_ACCRUAL_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_employee)],
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
