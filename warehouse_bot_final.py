@@ -17,7 +17,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters, CallbackQueryHandler
+    ConversationHandler, ContextTypes, filters, CallbackQueryHandler, PicklePersistence, PersistenceInput
 )
 from supabase import create_client, Client
 
@@ -26,6 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key — не публиковать нигде
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")  # постоянный том — переживает перезапуски контейнера
 
 TZ_MSK = zoneinfo.ZoneInfo("Europe/Moscow")
 
@@ -1587,15 +1588,27 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
-    if t == "❓ Помощь": await update.message.reply_text(RULES_TEXT, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    if t == "❓ Помощь":
+        await update.message.reply_text(RULES_TEXT, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    else:
+        # Страховка: если нажали кнопку вне активного диалога (например, после перезапуска),
+        # не молчим, а сразу показываем главное меню.
+        await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
 
 
 def main():
     db_service = SupabaseService()
-    application = Application.builder().token(BOT_TOKEN).build()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    persistence = PicklePersistence(
+        filepath=os.path.join(DATA_DIR, "bot_persistence.pickle"),
+        store_data=PersistenceInput(bot_data=False, chat_data=True, user_data=True, callback_data=True),
+    )
+    application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
     application.bot_data["db"] = db_service
 
     supply_conv = ConversationHandler(
+        name="supply_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📦 Закупка$"), supply_start)],
         states={
             SUPPLY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_category)],
@@ -1610,6 +1623,8 @@ def main():
     )
 
     payment_conv = ConversationHandler(
+        name="payment_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start)],
         states={
             PAYMENT_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_category)],
@@ -1622,6 +1637,8 @@ def main():
     )
 
     history_conv = ConversationHandler(
+        name="history_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📜 История$"), history_start)],
         states={
             HISTORY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_category)],
@@ -1630,6 +1647,8 @@ def main():
     )
 
     warehouse_conv = ConversationHandler(
+        name="warehouse_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start)],
         states={
             WAREHOUSE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_menu)],
@@ -1644,6 +1663,8 @@ def main():
     )
 
     employee_conv = ConversationHandler(
+        name="employee_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^👤 Сотрудники$"), employee_start)],
         states={
             EMPLOYEE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, employee_menu)],
@@ -1661,6 +1682,8 @@ def main():
     )
 
     balance_conv = ConversationHandler(
+        name="balance_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start)],
         states={
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
@@ -1670,6 +1693,8 @@ def main():
     )
 
     reminder_conv = ConversationHandler(
+        name="reminder_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^⏰ Напомнить$"), reminder_start)],
         states={
             REMINDER_TYPE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_type_select)],
@@ -1680,6 +1705,8 @@ def main():
     )
 
     add_conv = ConversationHandler(
+        name="add_conv",
+        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить$"), add_start)],
         states={
             ADD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_select)],
