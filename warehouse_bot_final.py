@@ -66,6 +66,7 @@ class SupabaseService:
         self.client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         self._category_cache = {}
         self._ip_cache = {}
+        self._account_cache = {}
         self._load_caches()
 
     def _load_caches(self):
@@ -73,6 +74,8 @@ class SupabaseService:
         self._category_cache = {c["name"]: c["id"] for c in cats}
         ips = self.client.table("ip").select("id,name").execute().data or []
         self._ip_cache = {i["name"]: i["id"] for i in ips}
+        accs = self.client.table("accounts").select("id,code").execute().data or []
+        self._account_cache = {a["code"]: a["id"] for a in accs}
 
     def refresh_ip_cache(self):
         self._load_caches()
@@ -82,6 +85,49 @@ class SupabaseService:
 
     def get_ip_id(self, name: str):
         return self._ip_cache.get(name)
+
+    def get_account_id(self, code: str):
+        return self._account_cache.get(code)
+
+    def post_journal_entry(self, operation_id, entry_date, debit_code, credit_code, amount, comment=""):
+        """Двойная запись: один дебет + один кредит на одну и ту же сумму. Невидимо для пользователя бота."""
+        self.client.table("journal_entries").insert({
+            "operation_id": operation_id,
+            "entry_date": entry_date,
+            "debit_account_id": self.get_account_id(debit_code),
+            "credit_account_id": self.get_account_id(credit_code),
+            "amount": amount,
+            "comment": comment,
+        }).execute()
+
+    def get_journal_entry_for_operation(self, operation_id: int):
+        res = self.client.table("journal_entries").select("*").eq("operation_id", operation_id).limit(1).execute()
+        data = res.data or []
+        return data[0] if data else None
+
+    def get_account_code_by_id(self, account_id: int):
+        for code, aid in self._account_cache.items():
+            if aid == account_id:
+                return code
+        return None
+
+    def get_trial_balance(self):
+        """Классический пробный баланс: обороты по дебету и кредиту каждого счёта."""
+        entries = self.client.table("journal_entries").select("debit_account_id,credit_account_id,amount").execute().data or []
+        accounts = self.client.table("accounts").select("id,code,name").order("code").execute().data or []
+        acc_map = {a["id"]: a for a in accounts}
+
+        totals = {a["id"]: {"debit": 0.0, "credit": 0.0, "code": a["code"], "name": a["name"]} for a in accounts}
+        for e in entries:
+            amt = float(e["amount"])
+            if e["debit_account_id"] in totals:
+                totals[e["debit_account_id"]]["debit"] += amt
+            if e["credit_account_id"] in totals:
+                totals[e["credit_account_id"]]["credit"] += amt
+
+        result = [v for v in totals.values() if v["debit"] or v["credit"]]
+        result.sort(key=lambda x: x["code"])
+        return result
 
     # --- Reference data ---
     def get_suppliers_list(self, type_filter: str = None):
@@ -540,7 +586,7 @@ async def supply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flow_type = "сырьё_от_поставщика" if is_raw else "расходники_от_поставщика"
 
     for item in d.get("s_items", []):
-        db.add_operation(
+        op_id = db.add_operation_returning_id(
             operation_date=op_date,
             ip_id=ip_id,
             counterparty_id=cp_id,
@@ -566,6 +612,12 @@ async def supply_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ip_id=None,
             marketplace=None,
             note=d["s_comment"],
+        )
+        # Двойная запись: Дт Запасы на складе / Кт Расчёты с поставщиками
+        db.post_journal_entry(
+            operation_id=op_id, entry_date=op_date,
+            debit_code="1200", credit_code="2000",
+            amount=item["total"], comment=f"Закупка: {item['product']} у {d['s_supplier']}",
         )
 
     _, grand_total = cart_summary_text(context)
@@ -687,9 +739,10 @@ async def payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cp = db.get_counterparty_by_name(d["p_supplier"])
     category_name = infer_category_name(d.get("p_cp_type", ""))
+    op_date = datetime.now(TZ_MSK).date().isoformat()
 
-    db.add_operation(
-        operation_date=datetime.now(TZ_MSK).date().isoformat(),
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date,
         ip_id=None,
         counterparty_id=(cp or {}).get("id"),
         category_id=db.get_category_id(category_name),
@@ -700,13 +753,21 @@ async def payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_method=d["p_type"],
         comment=d["p_comment"],
     )
+    # Двойная запись: Дт Расчёты с поставщиками/персоналом / Кт Касса или Расчётный счёт
+    payables_code = "2100" if d.get("p_cp_type") == "сотрудник" else "2000"
+    cash_code = "1000" if d["p_type"] == "Наличные" else "1010"
+    db.post_journal_entry(
+        operation_id=op_id, entry_date=op_date,
+        debit_code=payables_code, credit_code=cash_code,
+        amount=d["p_amount"], comment=f"Оплата: {d['p_supplier']} ({d['p_type']})",
+    )
     await update.message.reply_text("✅ Оплата успешно сохранена в систему!", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
 
 
 # --- BALANCE LOGIC ---
 async def balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["🔍 Один контрагент", "📋 Все долги"], ["❌ Главное меню"]]
+    kb = [["🔍 Один контрагент", "📋 Все долги"], ["📗 Пробный баланс"], ["❌ Главное меню"]]
     await update.message.reply_text("📊 *Баланс*\n\nЧто показать?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return BALANCE_MODE
 
@@ -735,6 +796,23 @@ async def balance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{icon} {d['name']}: *{d['balance']} ₽*")
             grand_total += d["balance"]
         lines.append(f"\n💰 *Итого по всем контрагентам: {round(grand_total, 2)} ₽*")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+        return ConversationHandler.END
+
+    elif t == "📗 Пробный баланс":
+        rows = db.get_trial_balance()
+        if not rows:
+            await update.message.reply_text("Проводок ещё нет.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        lines = ["📗 *Пробный баланс*\n_Счёт — Дебет / Кредит_\n"]
+        total_debit = total_credit = 0.0
+        for r in rows:
+            lines.append(f"{r['code']} {r['name']}: Дт {round(r['debit'],2)} / Кт {round(r['credit'],2)}")
+            total_debit += r["debit"]
+            total_credit += r["credit"]
+        lines.append(f"\n*Итого:* Дт {round(total_debit,2)} / Кт {round(total_credit,2)}")
+        status = "✅ Баланс сходится" if abs(total_debit - total_credit) < 0.01 else "⚠️ Расхождение!"
+        lines.append(status)
         await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
         return ConversationHandler.END
 
@@ -853,9 +931,10 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
     if t != "✅ Подтвердить отмену": return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
     row = context.user_data["reverse_target"]
+    op_date = datetime.now(TZ_MSK).date().isoformat()
 
     reversal_id = db.add_operation_returning_id(
-        operation_date=datetime.now(TZ_MSK).date().isoformat(),
+        operation_date=op_date,
         ip_id=row.get("ip_id"),
         counterparty_id=row.get("counterparty_id"),
         category_id=row.get("category_id"),
@@ -871,6 +950,18 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
         reversal_of=row["id"],
     )
     db.mark_operation_reversed(row["id"], reversal_id)
+
+    # Зеркалим проводку исходной операции (дебет и кредит меняются местами)
+    orig_entry = db.get_journal_entry_for_operation(row["id"])
+    if orig_entry:
+        debit_code = db.get_account_code_by_id(orig_entry["credit_account_id"])
+        credit_code = db.get_account_code_by_id(orig_entry["debit_account_id"])
+        if debit_code and credit_code:
+            db.post_journal_entry(
+                operation_id=reversal_id, entry_date=op_date,
+                debit_code=debit_code, credit_code=credit_code,
+                amount=float(orig_entry["amount"]), comment=f"Сторно проводки операции №{row['id']}",
+            )
 
     await update.message.reply_text(
         f"✅ Операция отменена. Создана компенсирующая запись на {-float(row['amount'])} ₽.\n"
@@ -1411,7 +1502,7 @@ async def emp_shift_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     category_id = db.get_category_id("Зарплата")
     comment = f"Смена {d['emp_date']} {d['emp_start']}–{d['emp_end']} ({d['emp_hours']}ч)"
-    db.add_operation(
+    op_id = db.add_operation_returning_id(
         operation_date=d["emp_date_iso"],
         ip_id=None,
         counterparty_id=d["emp_id"],
@@ -1422,6 +1513,11 @@ async def emp_shift_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status="confirmed",
         payment_method=None,
         comment=comment,
+    )
+    db.post_journal_entry(
+        operation_id=op_id, entry_date=d["emp_date_iso"],
+        debit_code="5100", credit_code="2100",
+        amount=d["emp_total"], comment=f"Начисление: {d['emp_name']} ({comment})",
     )
     kb = [["➕ Ещё смена (этот сотрудник)"], ["👤 Другой сотрудник", "✅ Готово"]]
     await update.message.reply_text(
@@ -1510,8 +1606,9 @@ async def emp_accrual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     db, d = context.bot_data.get("db"), context.user_data
 
     category_id = db.get_category_id("Зарплата")
-    db.add_operation(
-        operation_date=datetime.now(TZ_MSK).date().isoformat(),
+    op_date = datetime.now(TZ_MSK).date().isoformat()
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date,
         ip_id=None,
         counterparty_id=d["emp_id"],
         category_id=category_id,
@@ -1521,6 +1618,11 @@ async def emp_accrual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         status="confirmed",
         payment_method=None,
         comment=d["emp_comment"],
+    )
+    db.post_journal_entry(
+        operation_id=op_id, entry_date=op_date,
+        debit_code="5100", credit_code="2100",
+        amount=d["emp_amount"], comment=f"Начисление оклада: {d['emp_name']}",
     )
     await update.message.reply_text(f"✅ Начислено {d['emp_amount']} ₽ для {d['emp_name']}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     return ConversationHandler.END
