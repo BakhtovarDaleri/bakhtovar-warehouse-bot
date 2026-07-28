@@ -5,6 +5,7 @@ Version 7.0.0 - Migrated from Google Sheets to Supabase (Postgres)
 import os
 import re
 import logging
+import httpx
 from datetime import datetime, timedelta
 import zoneinfo
 from dotenv import load_dotenv
@@ -27,6 +28,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")  # service_role key — не публиковать нигде
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")  # постоянный том — переживает перезапуски контейнера
+
+# Ozon Seller API — ИП Булат (первый подключённый кабинет)
+OZON_BULAT_CLIENT_ID = os.getenv("OZON_BULAT_CLIENT_ID", "")
+OZON_BULAT_API_KEY = os.getenv("OZON_BULAT_API_KEY", "")
+OZON_API_BASE = "https://api-seller.ozon.ru"
 
 TZ_MSK = zoneinfo.ZoneInfo("Europe/Moscow")
 
@@ -366,6 +372,9 @@ class SupabaseService:
             "net_profit": round(revenue - total_expenses, 2),
         }
 
+    def upsert_ozon_transaction(self, **fields):
+        self.client.table("ozon_transactions").upsert(fields, on_conflict="ozon_operation_id").execute()
+
     def get_hourly_employees(self):
         """Сотрудники с почасовой ставкой (для учёта смен)."""
         res = self.client.table("counterparties").select("id,name,hourly_rate").eq("type", "сотрудник").not_.is_("hourly_rate", "null").order("name").execute()
@@ -450,6 +459,7 @@ def get_main_menu_keyboard(user_id):
     kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "👤 Сотрудники"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
+        kb.append(["🔄 Синхр. Ozon"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -2128,6 +2138,94 @@ def format_pnl_text(pnl: dict, date_from: str, date_to: str) -> str:
     return "\n".join(lines)
 
 
+# --- OZON SELLER API — синхронизация финансовых транзакций ---
+async def fetch_ozon_transactions(client_id: str, api_key: str, date_from: str, date_to: str):
+    """Забирает все финансовые транзакции Ozon за период (с пагинацией)."""
+    headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+    all_ops = []
+    page = 1
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        while True:
+            body = {
+                "filter": {"date": {"from": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z"}, "transaction_type": "all"},
+                "page": page,
+                "page_size": 1000,
+            }
+            resp = await http.post(f"{OZON_API_BASE}/v3/finance/transaction/list", headers=headers, json=body)
+            resp.raise_for_status()
+            data = resp.json()
+            ops = data.get("result", {}).get("operations", [])
+            all_ops.extend(ops)
+            page_count = data.get("result", {}).get("page_count", 1)
+            if page >= page_count or not ops:
+                break
+            page += 1
+    return all_ops
+
+
+async def sync_ozon_transactions(db: "SupabaseService", ip_name: str, client_id: str, api_key: str, date_from: str, date_to: str) -> int:
+    ops = await fetch_ozon_transactions(client_id, api_key, date_from, date_to)
+    ip_id = db.get_ip_id(ip_name)
+    count = 0
+    for op in ops:
+        posting = op.get("posting") or {}
+        items = op.get("items") or []
+        item_name = items[0].get("name") if items else None
+        sku = items[0].get("sku") if items else None
+        db.upsert_ozon_transaction(
+            ozon_operation_id=op.get("operation_id"),
+            ip_id=ip_id,
+            operation_date=(op.get("operation_date") or "")[:10] or date_from,
+            operation_type=op.get("operation_type"),
+            operation_type_name=op.get("operation_type_name"),
+            posting_number=posting.get("posting_number"),
+            sku=sku,
+            item_name=item_name,
+            amount=op.get("amount", 0),
+            accruals_for_sale=op.get("accruals_for_sale"),
+            commission_amount=op.get("sale_commission"),
+            delivery_charge=(op.get("delivery_charge") or {}).get("amount"),
+            return_delivery_charge=(op.get("return_delivery_charge") or {}).get("amount"),
+            raw_json=op,
+        )
+        count += 1
+    return count
+
+
+async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная автоматическая синхронизация — последние 3 дня (захватывает возможные корректировки)."""
+    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
+        return
+    db = context.bot_data.get("db")
+    date_to = datetime.now(TZ_MSK).date().isoformat()
+    date_from = (datetime.now(TZ_MSK).date() - timedelta(days=3)).isoformat()
+    try:
+        count = await sync_ozon_transactions(db, "Булат", OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
+        logger.info(f"Ozon sync: обновлено {count} транзакций за {date_from}–{date_to}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🔄 Ozon: синхронизировано {count} транзакций за {date_from} — {date_to}")
+    except Exception as e:
+        logger.error(f"Ozon sync failed: {e}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации Ozon: {e}")
+
+
+async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск синхронизации по кнопке (только админ)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
+        await update.message.reply_text("⚠️ Ключи Ozon ещё не настроены в переменных окружения.")
+        return
+    await update.message.reply_text("🔄 Синхронизирую данные с Ozon за последние 30 дней, подождите...")
+    db = context.bot_data.get("db")
+    date_to = datetime.now(TZ_MSK).date().isoformat()
+    date_from = (datetime.now(TZ_MSK).date() - timedelta(days=30)).isoformat()
+    try:
+        count = await sync_ozon_transactions(db, "Булат", OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
+        await update.message.reply_text(f"✅ Готово: синхронизировано {count} транзакций за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+
+
 # --- REMINDERS ---
 async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
@@ -2454,7 +2552,11 @@ def main():
     application.add_handler(balance_conv)
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
+    application.add_handler(MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_manual))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
+        application.job_queue.run_daily(run_ozon_sync_job, time=datetime.strptime("04:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
 
     application.run_polling()
 
