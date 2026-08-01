@@ -375,6 +375,12 @@ class SupabaseService:
     def upsert_ozon_transaction(self, **fields):
         self.client.table("ozon_transactions").upsert(fields, on_conflict="ozon_operation_id").execute()
 
+    def upsert_ozon_transactions_batch(self, rows: list):
+        """Пакетная запись — одним запросом вместо тысяч отдельных, чтобы не рвать соединение."""
+        if not rows:
+            return
+        self.client.table("ozon_transactions").upsert(rows, on_conflict="ozon_operation_id").execute()
+
     def get_hourly_employees(self):
         """Сотрудники с почасовой ставкой (для учёта смен)."""
         res = self.client.table("counterparties").select("id,name,hourly_rate").eq("type", "сотрудник").not_.is_("hourly_rate", "null").order("name").execute()
@@ -495,6 +501,8 @@ PROFIT_PACKAGING = "PROFIT_PACKAGING"
 PROFIT_MARKETPLACE = "PROFIT_MARKETPLACE"
 PROFIT_PERIOD = "PROFIT_PERIOD"
 PROFIT_PERIOD_CUSTOM = "PROFIT_PERIOD_CUSTOM"
+OZON_SYNC_PERIOD = "OZON_SYNC_PERIOD"
+OZON_SYNC_PERIOD_CUSTOM = "OZON_SYNC_PERIOD_CUSTOM"
 
 
 
@@ -2240,29 +2248,37 @@ async def fetch_ozon_transactions(client_id: str, api_key: str, date_from: str, 
 async def sync_ozon_transactions(db: "SupabaseService", ip_name: str, client_id: str, api_key: str, date_from: str, date_to: str) -> int:
     ops = await fetch_ozon_transactions(client_id, api_key, date_from, date_to)
     ip_id = db.get_ip_id(ip_name)
+    batch = []
     count = 0
+    BATCH_SIZE = 500
     for op in ops:
         posting = op.get("posting") or {}
         items = op.get("items") or []
         item_name = items[0].get("name") if items else None
         sku = items[0].get("sku") if items else None
-        db.upsert_ozon_transaction(
-            ozon_operation_id=op.get("operation_id"),
-            ip_id=ip_id,
-            operation_date=(op.get("operation_date") or "")[:10] or date_from,
-            operation_type=op.get("operation_type"),
-            operation_type_name=op.get("operation_type_name"),
-            posting_number=posting.get("posting_number"),
-            sku=sku,
-            item_name=item_name,
-            amount=op.get("amount", 0),
-            accruals_for_sale=op.get("accruals_for_sale"),
-            commission_amount=op.get("sale_commission"),
-            delivery_charge=(op.get("delivery_charge") or {}).get("amount"),
-            return_delivery_charge=(op.get("return_delivery_charge") or {}).get("amount"),
-            raw_json=op,
-        )
-        count += 1
+        batch.append({
+            "ozon_operation_id": op.get("operation_id"),
+            "ip_id": ip_id,
+            "operation_date": (op.get("operation_date") or "")[:10] or date_from,
+            "operation_type": op.get("operation_type"),
+            "operation_type_name": op.get("operation_type_name"),
+            "posting_number": posting.get("posting_number"),
+            "sku": sku,
+            "item_name": item_name,
+            "amount": op.get("amount", 0),
+            "accruals_for_sale": op.get("accruals_for_sale"),
+            "commission_amount": op.get("sale_commission"),
+            "delivery_charge": (op.get("delivery_charge") or {}).get("amount"),
+            "return_delivery_charge": (op.get("return_delivery_charge") or {}).get("amount"),
+            "raw_json": op,
+        })
+        if len(batch) >= BATCH_SIZE:
+            db.upsert_ozon_transactions_batch(batch)
+            count += len(batch)
+            batch = []
+    if batch:
+        db.upsert_ozon_transactions_batch(batch)
+        count += len(batch)
     return count
 
 
@@ -2288,21 +2304,13 @@ async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
         context.bot_data["ozon_sync_running"] = False
 
 
-async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной запуск синхронизации по кнопке (только админ)."""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
-        await update.message.reply_text("⚠️ Ключи Ozon ещё не настроены в переменных окружения.")
-        return
+async def _run_ozon_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_sync_running"):
-        await update.message.reply_text("⏳ Синхронизация уже идёт, подождите её завершения — не нажимайте повторно.")
+        await update.message.reply_text("⏳ Синхронизация уже идёт, подождите её завершения — не нажимайте повторно.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return
     context.bot_data["ozon_sync_running"] = True
-    await update.message.reply_text("🔄 Синхронизирую данные с Ozon за последние 30 дней, подождите...")
+    await update.message.reply_text(f"🔄 Синхронизирую данные с Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     db = context.bot_data.get("db")
-    date_to = datetime.now(TZ_MSK).date().isoformat()
-    date_from = (datetime.now(TZ_MSK).date() - timedelta(days=30)).isoformat()
     try:
         count = await sync_ozon_transactions(db, "Булат", OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
         await update.message.reply_text(f"✅ Готово: синхронизировано {count} транзакций за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -2310,6 +2318,62 @@ async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     finally:
         context.bot_data["ozon_sync_running"] = False
+
+
+async def ozon_sync_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: выбор периода синхронизации (только админ)."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
+        await update.message.reply_text("⚠️ Ключи Ozon ещё не настроены в переменных окружения.")
+        return ConversationHandler.END
+    t_now = datetime.now(TZ_MSK)
+    this_month_start = t_now.replace(day=1).strftime("%d.%m")
+    kb = [["Последние 30 дней"], [f"Этот месяц (с {this_month_start})"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("🔄 *Синхронизация Ozon*\n\nЗа какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    return OZON_SYNC_PERIOD
+
+
+async def ozon_sync_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    t_now = datetime.now(TZ_MSK)
+
+    if t == "Последние 30 дней":
+        date_from = (t_now.date() - timedelta(days=30)).isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_ozon_sync_and_reply(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if "Этот месяц" in t:
+        date_from = t_now.replace(day=1).date().isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_ozon_sync_and_reply(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if "Свой период" in t:
+        await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
+        return OZON_SYNC_PERIOD_CUSTOM
+
+    return OZON_SYNC_PERIOD
+
+
+async def ozon_sync_period_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try:
+        start_raw, end_raw = t.split("-")
+        start_parsed = parse_flexible_date(start_raw.strip(), TZ_MSK)
+        end_parsed = parse_flexible_date(end_raw.strip(), TZ_MSK)
+        if not start_parsed or not end_parsed:
+            raise ValueError
+        date_from, date_to = start_parsed[0], end_parsed[0]
+    except (ValueError, AttributeError):
+        await update.message.reply_text("⚠️ Не понял период. Формат: ДД.ММ-ДД.ММ, например 01.07-31.07. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return OZON_SYNC_PERIOD_CUSTOM
+
+    await _run_ozon_sync_and_reply(update, context, date_from, date_to)
+    return ConversationHandler.END
 
 
 # --- REMINDERS ---
@@ -2638,7 +2702,15 @@ def main():
     application.add_handler(balance_conv)
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
-    application.add_handler(MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_manual))
+    application.add_handler(ConversationHandler(
+        name="ozon_sync_conv",
+        persistent=True,
+        entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_start)],
+        states={
+            OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
+            OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
+        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+    ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
