@@ -2384,7 +2384,7 @@ def main():
     db_service = SupabaseService()
     os.makedirs(DATA_DIR, exist_ok=True)
     persistence = PicklePersistence(
-        filepath=os.path.join(DATA_DIR, "bot_persistence_v2.pickle"),
+        filepath=os.path.join(DATA_DIR, "bot_persistence_v3.pickle"),
         store_data=PersistenceInput(bot_data=False, chat_data=True, user_data=True, callback_data=True),
     )
     application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
