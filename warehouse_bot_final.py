@@ -2203,20 +2203,31 @@ def format_pnl_text(pnl: dict, date_from: str, date_to: str) -> str:
 
 # --- OZON SELLER API — синхронизация финансовых транзакций ---
 async def fetch_ozon_transactions(client_id: str, api_key: str, date_from: str, date_to: str):
-    """Забирает все финансовые транзакции Ozon за период (с пагинацией)."""
+    """Забирает все финансовые транзакции Ozon за период (с пагинацией и повтором при обрыве соединения)."""
     headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
     all_ops = []
     page = 1
-    async with httpx.AsyncClient(timeout=30.0) as http:
+    async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
         while True:
             body = {
                 "filter": {"date": {"from": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z"}, "transaction_type": "all"},
                 "page": page,
                 "page_size": 1000,
             }
-            resp = await http.post(f"{OZON_API_BASE}/v3/finance/transaction/list", headers=headers, json=body)
-            resp.raise_for_status()
-            data = resp.json()
+            last_error = None
+            for attempt in range(3):
+                try:
+                    resp = await http.post(f"{OZON_API_BASE}/v3/finance/transaction/list", headers=headers, json=body)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    last_error = None
+                    break
+                except (httpx.HTTPError, httpx.TransportError) as e:
+                    last_error = e
+                    logger.warning(f"Ozon API попытка {attempt+1}/3 не удалась (стр. {page}): {e}")
+            if last_error:
+                raise last_error
+
             ops = data.get("result", {}).get("operations", [])
             all_ops.extend(ops)
             page_count = data.get("result", {}).get("page_count", 1)
@@ -2259,6 +2270,10 @@ async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневная автоматическая синхронизация — последние 3 дня (захватывает возможные корректировки)."""
     if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
         return
+    if context.bot_data.get("ozon_sync_running"):
+        logger.info("Ozon sync: пропускаю плановый запуск — уже идёт другая синхронизация.")
+        return
+    context.bot_data["ozon_sync_running"] = True
     db = context.bot_data.get("db")
     date_to = datetime.now(TZ_MSK).date().isoformat()
     date_from = (datetime.now(TZ_MSK).date() - timedelta(days=3)).isoformat()
@@ -2269,6 +2284,8 @@ async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ozon sync failed: {e}")
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации Ozon: {e}")
+    finally:
+        context.bot_data["ozon_sync_running"] = False
 
 
 async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2278,6 +2295,10 @@ async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
         await update.message.reply_text("⚠️ Ключи Ozon ещё не настроены в переменных окружения.")
         return
+    if context.bot_data.get("ozon_sync_running"):
+        await update.message.reply_text("⏳ Синхронизация уже идёт, подождите её завершения — не нажимайте повторно.")
+        return
+    context.bot_data["ozon_sync_running"] = True
     await update.message.reply_text("🔄 Синхронизирую данные с Ozon за последние 30 дней, подождите...")
     db = context.bot_data.get("db")
     date_to = datetime.now(TZ_MSK).date().isoformat()
@@ -2287,6 +2308,8 @@ async def ozon_sync_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Готово: синхронизировано {count} транзакций за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    finally:
+        context.bot_data["ozon_sync_running"] = False
 
 
 # --- REMINDERS ---
