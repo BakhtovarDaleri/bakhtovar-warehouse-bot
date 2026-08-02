@@ -432,11 +432,22 @@ class SupabaseService:
         - Расходы = реальные начисления/расходы (зарплата, аренда, логистика до МП и т.д.), без отменённых сторно
         - Налог (1%) и доля Булата (2%) считаются автоматически от суммы поступлений
         """
-        ozon_rows = (
-            self.client.table("ozon_transactions").select("amount,item_name,marketplace,operation_type_name")
-            .gte("operation_date", date_from).lte("operation_date", date_to)
-            .execute().data or []
-        )
+        # Supabase по умолчанию отдаёт максимум 1000 строк за раз — для целого месяца строк может быть
+        # больше 10 000, поэтому явно постранично забираем всё, а не одним запросом.
+        ozon_rows = []
+        page_size = 1000
+        offset = 0
+        while True:
+            chunk = (
+                self.client.table("ozon_transactions").select("amount,item_name,marketplace,operation_type_name")
+                .gte("operation_date", date_from).lte("operation_date", date_to)
+                .range(offset, offset + page_size - 1)
+                .execute().data or []
+            )
+            ozon_rows.extend(chunk)
+            if len(chunk) < page_size:
+                break
+            offset += page_size
         revenue = round(sum(float(r["amount"]) for r in ozon_rows), 2)
 
         # Штук по товару (только реальные продажи, тип "Доставка покупателю")
