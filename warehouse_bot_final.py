@@ -1343,12 +1343,12 @@ async def logistics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["🚚 *История логистики до МП*\n"]
         for r in rows[-20:]:
             qty = r.get("quantity")
-            per_kg = f" ({round(float(r['amount'])/float(qty),2)}\u20bd/\u043a\u0433)" if qty else ""
+            per_kg = f" ({round(float(r['amount'])/float(qty),2)}₽/шт)" if qty else ""
             lines.append(f"▫️ {r.get('operation_date','')} | {r.get('comment','')} | {r['amount']}\u20bd{per_kg}")
         avg = round(total_amount / total_qty, 2) if total_qty else None
         lines.append(f"\n💰 Всего потрачено: {round(total_amount,2)} ₽")
         if avg:
-            lines.append(f"⚖️ Средняя стоимость: {avg} ₽/кг")
+            lines.append(f"⚖️ Средняя стоимость: {avg} ₽/шт")
         await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
         return ConversationHandler.END
 
@@ -1360,7 +1360,7 @@ async def logistics_marketplace(update: Update, context: ContextTypes.DEFAULT_TY
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад": return await warehouse_start(update, context)
     context.user_data["log_marketplace"] = t
-    await update.message.reply_text("Шаг 2: Сколько кг перевезли?", reply_markup=get_step_keyboard())
+    await update.message.reply_text("Шаг 2: Сколько ШТУК товара было в этой перевозке (на палете, суммарно)?", reply_markup=get_step_keyboard())
     return LOGISTICS_QTY
 
 
@@ -1383,7 +1383,7 @@ async def logistics_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     if t == "🔙 Назад":
-        await update.message.reply_text("Шаг 2: Сколько кг перевезли?", reply_markup=get_step_keyboard())
+        await update.message.reply_text("Шаг 2: Сколько ШТУК товара было в этой перевозке (на палете, суммарно)?", reply_markup=get_step_keyboard())
         return LOGISTICS_QTY
     try: context.user_data["log_amount"] = float(t.replace(",", ".").replace(" ", ""))
     except ValueError:
@@ -1415,7 +1415,7 @@ async def logistics_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["log_comment"] = t if t != "-" else ""
     d = context.user_data
     per_kg = round(d["log_amount"] / d["log_qty"], 2) if d["log_qty"] else 0
-    summary = f"🚚 *Логистика до {d['log_marketplace']}:*\n⚖️ {d['log_qty']} кг\n💰 {d['log_amount']} ₽ ({per_kg} ₽/кг)"
+    summary = f"🚚 *Логистика до {d['log_marketplace']}:*\n⚖️ {d['log_qty']} шт\n💰 {d['log_amount']} ₽ ({per_kg} ₽/шт)"
     await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
     return LOGISTICS_CONFIRM
 
@@ -2688,7 +2688,7 @@ def main():
     db_service = SupabaseService()
     os.makedirs(DATA_DIR, exist_ok=True)
     persistence = PicklePersistence(
-        filepath=os.path.join(DATA_DIR, "bot_persistence_v4.pickle"),
+        filepath=os.path.join(DATA_DIR, "bot_persistence_v5.pickle"),
         store_data=PersistenceInput(bot_data=False, chat_data=True, user_data=True, callback_data=True),
     )
     application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
