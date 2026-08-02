@@ -381,6 +381,16 @@ class SupabaseService:
             return
         self.client.table("ozon_transactions").upsert(rows, on_conflict="ozon_operation_id").execute()
 
+    def get_logistics_history(self):
+        cat_id = self.get_category_id("Логистика до маркетплейса")
+        res = (
+            self.client.table("operations").select("*")
+            .eq("category_id", cat_id)
+            .order("operation_date").order("id")
+            .execute()
+        )
+        return res.data or []
+
     def get_hourly_employees(self):
         """Сотрудники с почасовой ставкой (для учёта смен)."""
         res = self.client.table("counterparties").select("id,name,hourly_rate").eq("type", "сотрудник").not_.is_("hourly_rate", "null").order("name").execute()
@@ -475,6 +485,13 @@ WAREHOUSE_EXPENSE_PAYMENT = "WAREHOUSE_EXPENSE_PAYMENT"
 WAREHOUSE_EXPENSE_AMOUNT = "WAREHOUSE_EXPENSE_AMOUNT"
 WAREHOUSE_EXPENSE_COMMENT = "WAREHOUSE_EXPENSE_COMMENT"
 WAREHOUSE_EXPENSE_CONFIRM = "WAREHOUSE_EXPENSE_CONFIRM"
+LOGISTICS_MENU = "LOGISTICS_MENU"
+LOGISTICS_MARKETPLACE = "LOGISTICS_MARKETPLACE"
+LOGISTICS_QTY = "LOGISTICS_QTY"
+LOGISTICS_AMOUNT = "LOGISTICS_AMOUNT"
+LOGISTICS_PAYMENT = "LOGISTICS_PAYMENT"
+LOGISTICS_COMMENT = "LOGISTICS_COMMENT"
+LOGISTICS_CONFIRM = "LOGISTICS_CONFIRM"
 EMPLOYEE_MENU = "EMPLOYEE_MENU"
 EMP_SHIFT_EMPLOYEE = "EMP_SHIFT_EMPLOYEE"
 EMP_SHIFT_DATE = "EMP_SHIFT_DATE"
@@ -1162,7 +1179,7 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
 
 # --- WAREHOUSE (СКЛАД) ---
 async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы"], ["❌ Главное меню"]]
+    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы", "🚚 Логистика до МП"], ["❌ Главное меню"]]
     await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_MENU
 
@@ -1196,6 +1213,11 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await update.message.reply_text("Шаг 1: Категория расхода:", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True))
         return WAREHOUSE_EXPENSE_CATEGORY
+
+    elif t == "🚚 Логистика до МП":
+        kb2 = [["➕ Внести", "📜 История"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("🚚 *Логистика до маркетплейса*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True), parse_mode="Markdown")
+        return LOGISTICS_MENU
 
     return WAREHOUSE_MENU
 
@@ -1298,6 +1320,138 @@ async def warehouse_expense_confirm(update: Update, context: ContextTypes.DEFAUL
 
 async def warehouse_expense_comment_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Комментарий (или '-'):", reply_markup=get_step_keyboard())
+
+
+# --- Логистика до маркетплейса (реальные данные, не оценка) ---
+async def logistics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
+    db = context.bot_data.get("db")
+
+    if t == "➕ Внести":
+        kb = [["Ozon", "WB"], ["Яндекс", "Общий (несколько площадок)"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("Шаг 1: Куда везли (площадка)?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return LOGISTICS_MARKETPLACE
+
+    elif t == "📜 История":
+        rows = db.get_logistics_history()
+        if not rows:
+            await update.message.reply_text("История пуста — записей ещё не было.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        total_amount = sum(float(r["amount"]) for r in rows)
+        total_qty = sum(float(r["quantity"] or 0) for r in rows)
+        lines = ["🚚 *История логистики до МП*\n"]
+        for r in rows[-20:]:
+            qty = r.get("quantity")
+            per_kg = f" ({round(float(r['amount'])/float(qty),2)}\u20bd/\u043a\u0433)" if qty else ""
+            lines.append(f"▫️ {r.get('operation_date','')} | {r.get('comment','')} | {r['amount']}\u20bd{per_kg}")
+        avg = round(total_amount / total_qty, 2) if total_qty else None
+        lines.append(f"\n💰 Всего потрачено: {round(total_amount,2)} ₽")
+        if avg:
+            lines.append(f"⚖️ Средняя стоимость: {avg} ₽/кг")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+        return ConversationHandler.END
+
+    return LOGISTICS_MENU
+
+
+async def logistics_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад": return await warehouse_start(update, context)
+    context.user_data["log_marketplace"] = t
+    await update.message.reply_text("Шаг 2: Сколько кг перевезли?", reply_markup=get_step_keyboard())
+    return LOGISTICS_QTY
+
+
+async def logistics_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        kb = [["Ozon", "WB"], ["Яндекс", "Общий (несколько площадок)"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("Шаг 1: Куда везли (площадка)?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return LOGISTICS_MARKETPLACE
+    try: context.user_data["log_qty"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return LOGISTICS_QTY
+    await update.message.reply_text("Шаг 3: Сумма за перевозку (₽):", reply_markup=get_step_keyboard())
+    return LOGISTICS_AMOUNT
+
+
+async def logistics_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await update.message.reply_text("Шаг 2: Сколько кг перевезли?", reply_markup=get_step_keyboard())
+        return LOGISTICS_QTY
+    try: context.user_data["log_amount"] = float(t.replace(",", ".").replace(" ", ""))
+    except ValueError:
+        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return LOGISTICS_AMOUNT
+    kb = [["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]]
+    await update.message.reply_text("Шаг 4: Способ оплаты:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return LOGISTICS_PAYMENT
+
+
+async def logistics_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        await update.message.reply_text("Шаг 3: Сумма за перевозку (₽):", reply_markup=get_step_keyboard())
+        return LOGISTICS_AMOUNT
+    context.user_data["log_payment"] = t
+    await update.message.reply_text("Комментарий (например, номер поставки) или '-':", reply_markup=get_step_keyboard())
+    return LOGISTICS_COMMENT
+
+
+async def logistics_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    if t == "🔙 Назад":
+        kb = [["Наличные", "Карта ВТБ"], ["Безнал ИП"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("Шаг 4: Способ оплаты:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        return LOGISTICS_PAYMENT
+    context.user_data["log_comment"] = t if t != "-" else ""
+    d = context.user_data
+    per_kg = round(d["log_amount"] / d["log_qty"], 2) if d["log_qty"] else 0
+    summary = f"🚚 *Логистика до {d['log_marketplace']}:*\n⚖️ {d['log_qty']} кг\n💰 {d['log_amount']} ₽ ({per_kg} ₽/кг)"
+    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
+    return LOGISTICS_CONFIRM
+
+
+async def logistics_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "🔙 Назад":
+        await update.message.reply_text("Комментарий (например, номер поставки) или '-':", reply_markup=get_step_keyboard())
+        return LOGISTICS_COMMENT
+    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
+    db, d = context.bot_data.get("db"), context.user_data
+    op_date = datetime.now(TZ_MSK).date().isoformat()
+
+    category_id = db.get_category_id("Логистика до маркетплейса")
+    op_id = db.add_operation_returning_id(
+        operation_date=op_date,
+        ip_id=None,
+        counterparty_id=None,
+        category_id=category_id,
+        operation_type="расход",
+        amount=d["log_amount"],
+        quantity=d["log_qty"],
+        price=round(d["log_amount"] / d["log_qty"], 2) if d["log_qty"] else None,
+        entered_by=str(update.effective_user.id),
+        status="confirmed",
+        payment_method=d["log_payment"],
+        comment=f"{d['log_marketplace']}: {d['log_comment']}",
+    )
+    cash_code = "1000" if d["log_payment"] == "Наличные" else "1010"
+    db.post_journal_entry(
+        operation_id=op_id, entry_date=op_date,
+        debit_code="5900", credit_code=cash_code,
+        amount=d["log_amount"], comment=f"Логистика до {d['log_marketplace']}: {d['log_comment']}",
+    )
+    await update.message.reply_text("✅ Логистика внесена.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
 
 
 # --- Приход сырья ---
@@ -2601,6 +2755,13 @@ def main():
             WAREHOUSE_EXPENSE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_amount)],
             WAREHOUSE_EXPENSE_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_comment)],
             WAREHOUSE_EXPENSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_expense_confirm)],
+            LOGISTICS_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_menu)],
+            LOGISTICS_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_marketplace)],
+            LOGISTICS_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_qty)],
+            LOGISTICS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_amount)],
+            LOGISTICS_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_payment)],
+            LOGISTICS_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_comment)],
+            LOGISTICS_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_confirm)],
         }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
     )
 
