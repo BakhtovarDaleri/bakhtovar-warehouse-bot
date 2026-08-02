@@ -2701,7 +2701,7 @@ def main():
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -2713,7 +2713,7 @@ def main():
             PAYMENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAYMENT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     history_conv = ConversationHandler(
@@ -2724,7 +2724,7 @@ def main():
             HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
             HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
             HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     warehouse_conv = ConversationHandler(
@@ -2750,7 +2750,7 @@ def main():
             LOGISTICS_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_payment)],
             LOGISTICS_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_comment)],
             LOGISTICS_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     employee_conv = ConversationHandler(
@@ -2767,7 +2767,7 @@ def main():
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
             EMP_ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     sale_conv = ConversationHandler(
@@ -2779,7 +2779,7 @@ def main():
             SALE_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_packaging)],
             SALE_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_units)],
             SALE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     profit_conv = ConversationHandler(
@@ -2791,7 +2791,7 @@ def main():
             PROFIT_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_marketplace)],
             PROFIT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_period)],
             PROFIT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     balance_conv = ConversationHandler(
@@ -2800,7 +2800,7 @@ def main():
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
             BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     reminder_conv = ConversationHandler(
@@ -2810,7 +2810,7 @@ def main():
             REMINDER_INPUT_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_input_flow)],
             REMINDER_DATE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_date_select)],
             REMINDER_TIME_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_select)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     add_conv = ConversationHandler(
@@ -2822,7 +2822,7 @@ def main():
             ADD_SUPPLIER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_supplier_type)],
             ADD_PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
             ADD_PRODUCT_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_ip)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -2844,7 +2844,7 @@ def main():
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex("^❌ Главное меню$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
