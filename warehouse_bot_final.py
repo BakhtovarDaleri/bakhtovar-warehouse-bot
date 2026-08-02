@@ -18,7 +18,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters, CallbackQueryHandler, PicklePersistence, PersistenceInput
+    ConversationHandler, ContextTypes, filters, CallbackQueryHandler
 )
 from supabase import create_client, Client
 
@@ -2687,16 +2687,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     db_service = SupabaseService()
     os.makedirs(DATA_DIR, exist_ok=True)
-    persistence = PicklePersistence(
-        filepath=os.path.join(DATA_DIR, "bot_persistence_v5.pickle"),
-        store_data=PersistenceInput(bot_data=False, chat_data=True, user_data=True, callback_data=True),
-    )
-    application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     application.bot_data["db"] = db_service
 
     supply_conv = ConversationHandler(
-        name="supply_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📦 Закупка$"), supply_start)],
         states={
             SUPPLY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_category)],
@@ -2711,8 +2705,6 @@ def main():
     )
 
     payment_conv = ConversationHandler(
-        name="payment_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start)],
         states={
             PAYMENT_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_category)],
@@ -2725,8 +2717,6 @@ def main():
     )
 
     history_conv = ConversationHandler(
-        name="history_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📜 История$"), history_start)],
         states={
             HISTORY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_category)],
@@ -2738,8 +2728,6 @@ def main():
     )
 
     warehouse_conv = ConversationHandler(
-        name="warehouse_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start)],
         states={
             WAREHOUSE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_menu)],
@@ -2766,8 +2754,6 @@ def main():
     )
 
     employee_conv = ConversationHandler(
-        name="employee_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^👤 Сотрудники$"), employee_start)],
         states={
             EMPLOYEE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, employee_menu)],
@@ -2785,8 +2771,6 @@ def main():
     )
 
     sale_conv = ConversationHandler(
-        name="sale_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📥 Поступление$"), sale_start)],
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
@@ -2799,8 +2783,6 @@ def main():
     )
 
     profit_conv = ConversationHandler(
-        name="profit_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📈 Прибыль$"), profit_start)],
         states={
             PROFIT_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_mode)],
@@ -2813,8 +2795,6 @@ def main():
     )
 
     balance_conv = ConversationHandler(
-        name="balance_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start)],
         states={
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
@@ -2824,8 +2804,6 @@ def main():
     )
 
     reminder_conv = ConversationHandler(
-        name="reminder_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^⏰ Напомнить$"), reminder_start)],
         states={
             REMINDER_TYPE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_type_select)],
@@ -2836,8 +2814,6 @@ def main():
     )
 
     add_conv = ConversationHandler(
-        name="add_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^➕ Добавить$"), add_start)],
         states={
             ADD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_select)],
@@ -2864,8 +2840,6 @@ def main():
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
     application.add_handler(ConversationHandler(
-        name="ozon_sync_conv",
-        persistent=True,
         entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_start)],
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
