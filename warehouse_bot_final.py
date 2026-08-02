@@ -174,6 +174,12 @@ class SupabaseService:
                 names.append(n)
         return names
 
+    def upsert_warehouse_movements_batch(self, rows: list):
+        """Пакетное списание со склада по факту реальных продаж Ozon — идемпотентно (по ozon_operation_id)."""
+        if not rows:
+            return
+        self.client.table("warehouse_movements").upsert(rows, on_conflict="ozon_operation_id").execute()
+
     def add_warehouse_movement(self, **fields):
         self.client.table("warehouse_movements").insert(fields).execute()
 
@@ -381,6 +387,143 @@ class SupabaseService:
             return
         self.client.table("ozon_transactions").upsert(rows, on_conflict="ozon_operation_id").execute()
 
+    def get_warehouse_activity_history(self):
+        """Единая история всех действий по складу: постоянные расходы, логистика, отгрузки — по датам вместе."""
+        items = []
+
+        ops = (
+            self.client.table("operations").select("operation_date,amount,payment_method,comment,category_id")
+            .is_("counterparty_id", "null")
+            .execute().data or []
+        )
+        cats = self.client.table("categories").select("id,name").execute().data or []
+        cat_map = {c["id"]: c["name"] for c in cats}
+        logistics_cat_id = self.get_category_id("Логистика до маркетплейса")
+
+        for r in ops:
+            cat_name = cat_map.get(r.get("category_id"), "")
+            icon = "🚚" if r.get("category_id") == logistics_cat_id else "💸"
+            items.append({
+                "date": r.get("operation_date", ""),
+                "label": f"{icon} {cat_name}",
+                "detail": f"{r.get('comment','')} — {r['amount']} ₽",
+            })
+
+        moves = (
+            self.client.table("warehouse_movements").select("movement_date,product_name,quantity,packaging,marketplace,direction")
+            .eq("direction", "расход")
+            .execute().data or []
+        )
+        for m in moves:
+            items.append({
+                "date": m.get("movement_date", ""),
+                "label": "📤 Отгрузка",
+                "detail": f"{m.get('product_name','')} ({m.get('packaging') or ''}) {m.get('quantity')}кг → {m.get('marketplace') or ''}",
+            })
+
+        items.sort(key=lambda x: x["date"])
+        return items
+
+    def get_full_period_profit(self, date_from: str, date_to: str):
+        """
+        Настоящая прибыль за период — только по фактическим данным:
+        - Выручка = реальные суммы из Ozon (уже после комиссии/эквайринга/логистики площадки/рекламы)
+        - Себестоимость = реальная средневзвешенная цена сырья × реально проданные штуки
+        - Расходы = реальные начисления/расходы (зарплата, аренда, логистика до МП и т.д.), без отменённых сторно
+        - Налог (1%) и доля Булата (2%) считаются автоматически от суммы поступлений
+        """
+        ozon_rows = (
+            self.client.table("ozon_transactions").select("amount,item_name,marketplace,operation_type_name")
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .execute().data or []
+        )
+        revenue = round(sum(float(r["amount"]) for r in ozon_rows), 2)
+
+        # Штук по товару (только реальные продажи, тип "Доставка покупателю")
+        units_by_product = {}
+        for r in ozon_rows:
+            if r.get("operation_type_name") == "Доставка покупателю" and r.get("item_name"):
+                units_by_product[r["item_name"]] = units_by_product.get(r["item_name"], 0) + 1
+
+        # Себестоимость по каждому товару — через сопоставление названия Ozon с нашими товарами по ключевым словам
+        products = self.client.table("products").select("name").execute().data or []
+        product_names = [p["name"] for p in products]
+
+        cogs_total = 0.0
+        packaging_total = 0.0
+        product_breakdown = []
+        for ozon_name, units in units_by_product.items():
+            matched = next((p for p in product_names if p.lower() in ozon_name.lower()), None)
+            cost_per_kg = self.get_material_cost_per_kg(matched) if matched else None
+            packaging_per_unit, _ = self.get_packaging_cost_per_unit(matched) if matched else (None, [])
+            item_revenue = round(sum(float(r["amount"]) for r in ozon_rows if r.get("item_name") == ozon_name), 2)
+            item_cogs = round(cost_per_kg * units, 2) if cost_per_kg else 0.0
+            item_packaging = round((packaging_per_unit or 0) * units, 2)
+            cogs_total += item_cogs
+            packaging_total += item_packaging
+            product_breakdown.append({
+                "name": matched or ozon_name, "units": units,
+                "revenue": item_revenue, "cogs": item_cogs, "packaging": item_packaging,
+                "margin": round(item_revenue - item_cogs - item_packaging, 2),
+            })
+        product_breakdown.sort(key=lambda x: -x["revenue"])
+        cogs_total = round(cogs_total, 2)
+        packaging_total = round(packaging_total, 2)
+
+        # Реальные расходы (зарплата, постоянные расходы, логистика до МП) — без отменённых сторно
+        ops = (
+            self.client.table("operations").select("amount,category_id,operation_type")
+            .in_("operation_type", ["начисление", "расход"])
+            .is_("reversed_by", "null")
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .execute().data or []
+        )
+        cats = self.client.table("categories").select("id,name").execute().data or []
+        cat_map = {c["id"]: c["name"] for c in cats}
+        expenses_by_category = {}
+        expenses_total = 0.0
+        for r in ops:
+            name = cat_map.get(r["category_id"], "Без категории")
+            amt = float(r["amount"])
+            expenses_by_category[name] = expenses_by_category.get(name, 0.0) + amt
+            expenses_total += amt
+
+        tax = round(revenue * 0.01, 2)
+        bulat_share = round(revenue * 0.02, 2)
+
+        net_profit = round(revenue - cogs_total - packaging_total - expenses_total - tax - bulat_share, 2)
+
+        return {
+            "revenue": revenue,
+            "cogs_total": cogs_total,
+            "packaging_total": packaging_total,
+            "product_breakdown": product_breakdown,
+            "expenses_by_category": sorted(expenses_by_category.items(), key=lambda x: -x[1]),
+            "expenses_total": round(expenses_total, 2),
+            "tax": tax,
+            "bulat_share": bulat_share,
+            "net_profit": net_profit,
+        }
+
+    def get_packaging_cost_per_unit(self, product_name: str):
+        """
+        Реальная себестоимость расходников на 1 штуку — считается по рецептуре (product_recipes)
+        и реальной средневзвешенной цене каждого расходника (из фактических закупок).
+        """
+        recipe = self.client.table("product_recipes").select("consumable_name,qty_per_unit").eq("product_name", product_name).execute().data or []
+        if not recipe:
+            return None, []
+        total = 0.0
+        breakdown = []
+        for r in recipe:
+            price = self.get_material_cost_per_kg(r["consumable_name"])  # универсальная средневзвешенная, работает для любых названий
+            if price is None:
+                continue
+            cost = round(price * float(r["qty_per_unit"]), 4)
+            total += cost
+            breakdown.append({"name": r["consumable_name"], "qty": r["qty_per_unit"], "price": price, "cost": cost})
+        return round(total, 2), breakdown
+
     def get_logistics_history(self):
         cat_id = self.get_category_id("Логистика до маркетплейса")
         res = (
@@ -544,7 +687,7 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
 
 
 def get_main_menu_keyboard(user_id):
-    kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "👤 Сотрудники"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
+    kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
         kb.append(["🔄 Синхр. Ozon"])
@@ -1179,7 +1322,7 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
 
 # --- WAREHOUSE (СКЛАД) ---
 async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы", "🚚 Логистика до МП"], ["❌ Главное меню"]]
+    kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы", "🚚 Логистика до МП"], ["👤 Сотрудники", "📋 История работ"], ["❌ Главное меню"]]
     await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_MENU
 
@@ -1215,9 +1358,23 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAREHOUSE_EXPENSE_CATEGORY
 
     elif t == "🚚 Логистика до МП":
-        kb2 = [["➕ Внести", "📜 История"], ["🔙 Назад", "❌ Главное меню"]]
-        await update.message.reply_text("🚚 *Логистика до маркетплейса*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb2, resize_keyboard=True), parse_mode="Markdown")
-        return LOGISTICS_MENU
+        kb = [["Ozon", "WB"], ["Яндекс", "Общий (несколько площадок)"], ["🔙 Назад", "❌ Главное меню"]]
+        await update.message.reply_text("🚚 *Логистика до маркетплейса*\n\nШаг 1: Куда везли (площадка)?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+        return LOGISTICS_MARKETPLACE
+
+    elif t == "👤 Сотрудники":
+        return await employee_start(update, context)
+
+    elif t == "📋 История работ":
+        rows = db.get_warehouse_activity_history()
+        if not rows:
+            await update.message.reply_text("История пуста — записей ещё не было.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        lines = ["📋 *История работ по складу*\n"]
+        for r in rows[-25:]:
+            lines.append(f"▫️ {r['date']} | {r['label']} | {r['detail']}")
+        await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+        return ConversationHandler.END
 
     return WAREHOUSE_MENU
 
@@ -2089,231 +2246,39 @@ async def emp_accrual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# --- ПРОДАЖА (упрощённо — только реально поступившая сумма от площадки) ---
+# --- ПРОДАЖА (реальная прибыль: по площадкам, по товарам, чистыми) ---
 async def sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data.get("db")
-    ips = db.get_my_ip_list()
-    await update.message.reply_text("💵 *Поступление от площадки*\n\nШаг 1: Какое ИП?", reply_markup=build_grid_keyboard(ips, columns=2), parse_mode="Markdown")
+    t_now = datetime.now(TZ_MSK)
+    this_month_start = t_now.replace(day=1).strftime("%d.%m")
+    kb = [[f"Этот месяц (с {this_month_start})"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("💵 *Продажа — прибыль за период*\n\nЗа какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return SALE_IP
 
 
-async def show_sale_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["Ozon", "WB"], ["Яндекс"], ["🔙 Назад", "❌ Главное меню"]]
-    await update.message.reply_text("Шаг 2: Какая площадка?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+def format_full_profit_text(p: dict, date_from: str, date_to: str) -> str:
+    lines = [f"💵 *Прибыль за период {date_from} — {date_to}*\n"]
+    lines.append(f"💰 Выручка (реально от площадок, после всех их вычетов): *{p['revenue']} ₽*\n")
 
+    lines.append("📦 *По товарам:*")
+    for item in p["product_breakdown"]:
+        lines.append(f"▫️ {item['name']}: {item['units']} шт | выручка {item['revenue']} ₽ | сырьё {item['cogs']} ₽ | расходники {item['packaging']} ₽ | маржа {item['margin']} ₽")
+    lines.append(f"\n🌰 Себестоимость сырья всего: {p['cogs_total']} ₽")
+    lines.append(f"📦 Расходники всего (по рецептуре, реальные цены): {p['packaging_total']} ₽\n")
 
-async def show_sale_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Шаг 3: За какую дату/период поступление? Можно просто число (например 15) или Сегодня:",
-        reply_markup=ReplyKeyboardMarkup([["Сегодня"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True)
-    )
+    lines.append("📉 *Прочие расходы:*")
+    for name, amt in p["expenses_by_category"]:
+        lines.append(f"▫️ {name}: {round(amt,2)} ₽")
+    lines.append(f"\n📉 Всего прочих расходов: {p['expenses_total']} ₽")
+    lines.append(f"🏛 Налог (1%): {p['tax']} ₽")
+    lines.append(f"🤝 Доля Булата (2%): {p['bulat_share']} ₽")
 
-
-async def show_sale_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Шаг 4: Сколько реально поступило (₽), по отчёту площадки:", reply_markup=get_step_keyboard())
-
-
-async def show_sale_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Комментарий (например «за период 1-15 июля») или '-':", reply_markup=get_step_keyboard())
+    profit_word = "Чистая прибыль" if p["net_profit"] >= 0 else "Убыток"
+    lines.append(f"\n💰 *{profit_word}: {p['net_profit']} ₽*")
+    return "\n".join(lines)
 
 
 async def sale_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад": return await cancel_to_menu(update, context)
-    context.user_data["sale_ip"] = t
-    await show_sale_marketplace(update, context)
-    return SALE_MARKETPLACE
-
-
-async def sale_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад": return await sale_start(update, context)
-    context.user_data["sale_marketplace"] = t
-    await show_sale_date(update, context)
-    return SALE_PRODUCT  # переиспользуем состояние под ввод даты
-
-
-async def sale_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переиспользовано под ввод даты поступления (было — выбор товара в старой версии)."""
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await show_sale_marketplace(update, context)
-        return SALE_MARKETPLACE
-    parsed = parse_flexible_date(t, TZ_MSK)
-    if not parsed:
-        await update.message.reply_text("⚠️ Не разобрал дату. Напишите число (15), 15.07, или Сегодня:")
-        return SALE_PRODUCT
-    context.user_data["sale_date_iso"], context.user_data["sale_date_display"] = parsed
-    await show_sale_amount(update, context)
-    return SALE_PACKAGING  # переиспользуем состояние под ввод суммы
-
-
-async def sale_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переиспользовано под ввод суммы поступления (было — фасовка в старой версии)."""
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await show_sale_date(update, context)
-        return SALE_PRODUCT
-    try: context.user_data["sale_amount"] = float(t.replace(",", ".").replace(" ", ""))
-    except ValueError:
-        await update.message.reply_text("⚠️ Нужно ввести число. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
-        return SALE_PACKAGING
-    await show_sale_comment(update, context)
-    return SALE_UNITS  # переиспользуем состояние под комментарий
-
-
-async def sale_units(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Переиспользовано под комментарий (было — кол-во штук в старой версии)."""
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await show_sale_amount(update, context)
-        return SALE_PACKAGING
-    context.user_data["sale_comment"] = t if t != "-" else ""
-    d = context.user_data
-    summary = (
-        f"💵 *Поступление от площадки:*\n"
-        f"🏛 ИП: {d['sale_ip']}\n🛒 Площадка: {d['sale_marketplace']}\n"
-        f"📅 Дата: {d['sale_date_display']}\n💰 Сумма: {d['sale_amount']} ₽"
-    )
-    await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить"], ["🔙 Назад", "❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
-    return SALE_CONFIRM
-
-
-async def sale_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "🔙 Назад":
-        await show_sale_comment(update, context)
-        return SALE_UNITS
-    if t != "✅ Подтвердить": return await cancel_to_menu(update, context)
-    db, d = context.bot_data.get("db"), context.user_data
-
-    ip_id = db.get_ip_id(d["sale_ip"])
-    category_id = db.get_category_id("Продажа (доход)")
-    db.add_operation_returning_id(
-        operation_date=d["sale_date_iso"],
-        ip_id=ip_id,
-        counterparty_id=None,
-        category_id=category_id,
-        operation_type="поступление",
-        amount=d["sale_amount"],
-        entered_by=str(update.effective_user.id),
-        status="confirmed",
-        payment_method=None,
-        comment=f"{d['sale_marketplace']}: {d['sale_comment']}",
-    )
-    # Двойная запись: Дт Расчётный счёт / Кт Выручка — простая и честная, без оценок
-    db.post_journal_entry(
-        operation_id=None, entry_date=d["sale_date_iso"],
-        debit_code="1010", credit_code="6000",
-        amount=d["sale_amount"], comment=f"Поступление {d['sale_marketplace']}: {d['sale_comment']}",
-    )
-    await update.message.reply_text(f"✅ Поступление внесено: {d['sale_amount']} ₽ ({d['sale_marketplace']}).", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-    return ConversationHandler.END
-
-
-# --- ПРИБЫЛЬ ---
-async def profit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["💹 Прибыль за штуку", "📊 Прибыль за период"], ["❌ Главное меню"]]
-    await update.message.reply_text("📈 *Прибыль*\n\nЧто показать?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
-    return PROFIT_MODE
-
-
-async def profit_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
-    db = context.bot_data.get("db")
-
-    if t == "💹 Прибыль за штуку":
-        products = db.get_all_product_names()
-        await update.message.reply_text("Выберите товар:", reply_markup=build_grid_keyboard(products, columns=2))
-        return PROFIT_PRODUCT
-
-    elif t == "📊 Прибыль за период":
-        t_now = datetime.now(TZ_MSK)
-        this_month_start = t_now.replace(day=1).strftime("%d.%m")
-        kb = [[f"Этот месяц (с {this_month_start})"], ["Свой период (начало-конец)"], ["❌ Главное меню"]]
-        await update.message.reply_text("За какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-        return PROFIT_PERIOD
-
-    return PROFIT_MODE
-
-
-async def profit_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад": return await profit_start(update, context)
-    context.user_data["profit_product"] = t
-    await update.message.reply_text("Фасовка (например «250г»):", reply_markup=get_step_keyboard())
-    return PROFIT_PACKAGING
-
-
-async def profit_packaging(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        products = context.bot_data.get("db").get_all_product_names()
-        await update.message.reply_text("Выберите товар:", reply_markup=build_grid_keyboard(products, columns=2))
-        return PROFIT_PRODUCT
-
-    grams = parse_packaging_grams(t)
-    if not grams:
-        await update.message.reply_text("⚠️ Не понял фасовку. Введите, например, «250г».", reply_markup=get_step_keyboard())
-        return PROFIT_PACKAGING
-
-    context.user_data["profit_packaging"] = t
-    kb = [["Ozon", "WB"], ["Яндекс"], ["🔙 Назад", "❌ Главное меню"]]
-    await update.message.reply_text("Для какой площадки считаем (логистика разная)?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
-    return PROFIT_MARKETPLACE
-
-
-async def profit_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
-    if t == "🔙 Назад":
-        await update.message.reply_text("Фасовка (например «250г»):", reply_markup=get_step_keyboard())
-        return PROFIT_PACKAGING
-
-    db = context.bot_data.get("db")
-    product = context.user_data["profit_product"]
-    packaging = context.user_data["profit_packaging"]
-    grams = parse_packaging_grams(packaging)
-
-    cost_per_kg = db.get_material_cost_per_kg(product)
-    if not cost_per_kg:
-        await update.message.reply_text(f"⚠️ Нет данных о закупках «{product}» с известной ценой — себестоимость сырья посчитать нельзя.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-        return ConversationHandler.END
-
-    comp = db.get_unit_cost_components(product, packaging) or {}
-    labor = float(comp.get("labor") or LABOR_COST_PER_UNIT)
-    packaging_cost = float(comp.get("packaging_cost") or 0)
-    rent = float(comp.get("rent") or 0)
-    logistics_map = {"Ozon": comp.get("logistics_ozon"), "WB": comp.get("logistics_wb"), "Яндекс": comp.get("logistics_yandex")}
-    logistics = logistics_map.get(t)
-    logistics = float(logistics) if logistics is not None else 0.0
-
-    material_cost = round(cost_per_kg * grams / 1000, 2)
-    total_cost = round(material_cost + labor + packaging_cost + rent + logistics, 2)
-
-    text = (
-        f"💹 *Полная себестоимость: {product} ({packaging}) — {t}*\n\n"
-        f"🌰 Сырьё ({cost_per_kg} ₽/кг × {grams}г): {material_cost} ₽\n"
-        f"👤 Труд: {labor} ₽\n"
-        f"📦 Расходники: {packaging_cost} ₽\n"
-        f"🏭 Аренда: {rent} ₽\n"
-        f"🚚 Логистика ({t}): {logistics} ₽\n"
-        f"💰 *Итого себестоимость 1 шт: {total_cost} ₽*\n\n"
-        f"_Чтобы узнать прибыль — сравните эту цифру с реальной ценой продажи на {t}._"
-    )
-    await update.message.reply_text(text, reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
-    return ConversationHandler.END
-
-
-async def profit_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переиспользовано под выбор периода."""
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
@@ -2323,19 +2288,19 @@ async def profit_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         date_from = t_now.replace(day=1).date().isoformat()
         date_to = t_now.date().isoformat()
     else:
-        await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-18.07):", reply_markup=get_step_keyboard())
-        return PROFIT_PERIOD_CUSTOM
+        await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
+        return SALE_MARKETPLACE
 
-    pnl = db.get_period_pnl(date_from, date_to)
-    await update.message.reply_text(format_pnl_text(pnl, date_from, date_to), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    p = db.get_full_period_profit(date_from, date_to)
+    await update.message.reply_text(format_full_profit_text(p, date_from, date_to), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
     return ConversationHandler.END
 
 
-async def profit_period_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sale_marketplace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переиспользовано под ввод своего периода."""
     t = update.message.text.strip()
     if t == "❌ Главное меню": return await cancel_to_menu(update, context)
     db = context.bot_data.get("db")
-    t_now = datetime.now(TZ_MSK)
 
     try:
         start_raw, end_raw = t.split("-")
@@ -2346,21 +2311,11 @@ async def profit_period_custom(update: Update, context: ContextTypes.DEFAULT_TYP
         date_from, date_to = start_parsed[0], end_parsed[0]
     except (ValueError, AttributeError):
         await update.message.reply_text("⚠️ Не понял период. Формат: ДД.ММ-ДД.ММ. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
-        return PROFIT_PERIOD_CUSTOM
+        return SALE_MARKETPLACE
 
-    pnl = db.get_period_pnl(date_from, date_to)
-    await update.message.reply_text(format_pnl_text(pnl, date_from, date_to), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
+    p = db.get_full_period_profit(date_from, date_to)
+    await update.message.reply_text(format_full_profit_text(p, date_from, date_to), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
     return ConversationHandler.END
-
-
-def format_pnl_text(pnl: dict, date_from: str, date_to: str) -> str:
-    lines = [f"📊 *Прибыль за период {date_from} — {date_to}*\n", f"💰 Выручка: *{pnl['revenue']} ₽*\n", "📉 *Расходы по категориям:*"]
-    for name, amt in pnl["expenses_by_category"]:
-        lines.append(f"▫️ {name}: {round(amt,2)} ₽")
-    lines.append(f"\n📉 Всего расходов: *{pnl['total_expenses']} ₽*")
-    profit_word = "Прибыль" if pnl["net_profit"] >= 0 else "Убыток"
-    lines.append(f"\n💰 *{profit_word}: {pnl['net_profit']} ₽*")
-    return "\n".join(lines)
 
 
 # --- OZON SELLER API — синхронизация финансовых транзакций ---
@@ -2410,10 +2365,11 @@ async def sync_ozon_transactions(db: "SupabaseService", ip_name: str, client_id:
         items = op.get("items") or []
         item_name = items[0].get("name") if items else None
         sku = items[0].get("sku") if items else None
+        op_date = (op.get("operation_date") or "")[:10] or date_from
         batch.append({
             "ozon_operation_id": op.get("operation_id"),
             "ip_id": ip_id,
-            "operation_date": (op.get("operation_date") or "")[:10] or date_from,
+            "operation_date": op_date,
             "operation_type": op.get("operation_type"),
             "operation_type_name": op.get("operation_type_name"),
             "posting_number": posting.get("posting_number"),
@@ -2456,6 +2412,50 @@ async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации Ozon: {e}")
     finally:
         context.bot_data["ozon_sync_running"] = False
+
+
+async def run_fixed_costs_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневная проверка: не пора ли автоматически начислить аренду (1 числа) или пропуск (раз в ~3 месяца)."""
+    db = context.bot_data.get("db")
+    today = datetime.now(TZ_MSK).date()
+    rent_cat_id = db.get_category_id("Аренда склада")
+    propusk_cat_id = db.get_category_id("Пропуск")
+
+    if today.day == 1:
+        existing = (
+            db.client.table("operations").select("id")
+            .eq("category_id", rent_cat_id)
+            .gte("operation_date", today.isoformat())
+            .execute().data or []
+        )
+        if not existing:
+            for amount, method in [(22000, "Безнал ИП"), (38000, "Наличные")]:
+                op_id = db.add_operation_returning_id(
+                    operation_date=today.isoformat(), ip_id=None, counterparty_id=None,
+                    category_id=rent_cat_id, operation_type="расход", amount=amount,
+                    entered_by="auto_monthly", status="confirmed", payment_method=method,
+                    comment="Автоначисление: аренда склада Fud City",
+                )
+                cash_code = "1000" if method == "Наличные" else "1010"
+                db.post_journal_entry(operation_id=op_id, entry_date=today.isoformat(), debit_code="5900", credit_code=cash_code, amount=amount, comment="Аренда склада (авто)")
+            await context.bot.send_message(chat_id=ADMIN_ID, text="💸 Автоматически начислена аренда склада: 22 000₽ безнал + 38 000₽ наличные.")
+
+    last_propusk = (
+        db.client.table("operations").select("operation_date")
+        .eq("category_id", propusk_cat_id)
+        .order("operation_date", desc=True).limit(1)
+        .execute().data or []
+    )
+    days_since = 9999 if not last_propusk else (today - datetime.strptime(last_propusk[0]["operation_date"], "%Y-%m-%d").date()).days
+    if days_since >= 90:
+        op_id = db.add_operation_returning_id(
+            operation_date=today.isoformat(), ip_id=None, counterparty_id=None,
+            category_id=propusk_cat_id, operation_type="расход", amount=5000,
+            entered_by="auto_quarterly", status="confirmed", payment_method="Безнал ИП",
+            comment="Автоначисление: пропуск (Бахтовар + Диловар, на 3 мес.)",
+        )
+        db.post_journal_entry(operation_id=op_id, entry_date=today.isoformat(), debit_code="5900", credit_code="1010", amount=5000, comment="Пропуск (авто)")
+        await context.bot.send_message(chat_id=ADMIN_ID, text="💸 Автоматически начислен пропуск: 5 000₽ (прошло 90+ дней с прошлого раза).")
 
 
 async def _run_ozon_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
@@ -2750,12 +2750,6 @@ def main():
             LOGISTICS_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_payment)],
             LOGISTICS_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_comment)],
             LOGISTICS_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, logistics_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
-    )
-
-    employee_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^👤 Сотрудники$"), employee_start)],
-        states={
             EMPLOYEE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, employee_menu)],
             EMP_SHIFT_EMPLOYEE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_employee)],
             EMP_SHIFT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_shift_date)],
@@ -2771,26 +2765,10 @@ def main():
     )
 
     sale_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📥 Поступление$"), sale_start)],
+        entry_points=[MessageHandler(filters.Regex("^💵 Продажа$"), sale_start)],
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
-            SALE_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_product)],
-            SALE_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_packaging)],
-            SALE_UNITS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_units)],
-            SALE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
-    )
-
-    profit_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📈 Прибыль$"), profit_start)],
-        states={
-            PROFIT_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_mode)],
-            PROFIT_PRODUCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_product)],
-            PROFIT_PACKAGING: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_packaging)],
-            PROFIT_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_marketplace)],
-            PROFIT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_period)],
-            PROFIT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, profit_period_custom)],
         }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     )
 
@@ -2832,10 +2810,7 @@ def main():
     application.add_handler(payment_conv)
     application.add_handler(history_conv)
     application.add_handler(warehouse_conv)
-    application.add_handler(employee_conv)
-    # sale_conv и profit_conv временно отключены — раздел "Продажи/Прибыль" будет доработан отдельно
-    # application.add_handler(sale_conv)
-    # application.add_handler(profit_conv)
+    application.add_handler(sale_conv)
     application.add_handler(balance_conv)
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
@@ -2850,6 +2825,7 @@ def main():
 
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
         application.job_queue.run_daily(run_ozon_sync_job, time=datetime.strptime("04:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
+    application.job_queue.run_daily(run_fixed_costs_job, time=datetime.strptime("05:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
 
     application.run_polling()
 
