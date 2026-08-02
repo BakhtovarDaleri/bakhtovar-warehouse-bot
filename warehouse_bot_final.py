@@ -439,7 +439,7 @@ class SupabaseService:
         offset = 0
         while True:
             chunk = (
-                self.client.table("ozon_transactions").select("amount,item_name,marketplace,operation_type_name")
+                self.client.table("ozon_transactions").select("amount,item_name,operation_type_name")
                 .gte("operation_date", date_from).lte("operation_date", date_to)
                 .range(offset, offset + page_size - 1)
                 .execute().data or []
@@ -2695,6 +2695,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
 
 
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит ЛЮБУЮ необработанную ошибку — чтобы бот больше никогда не 'молчал' вместо ответа."""
+    logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                f"⚠️ Произошла ошибка при обработке запроса:\n`{context.error}`\n\nПопробуйте ещё раз или вернитесь в главное меню.",
+                reply_markup=get_main_menu_keyboard(update.effective_user.id),
+                parse_mode="Markdown",
+            )
+    except Exception:
+        pass
+    if ADMIN_ID:
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка в боте: {context.error}")
+        except Exception:
+            pass
+
+
 def main():
     db_service = SupabaseService()
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -2837,6 +2856,8 @@ def main():
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
         application.job_queue.run_daily(run_ozon_sync_job, time=datetime.strptime("04:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
     application.job_queue.run_daily(run_fixed_costs_job, time=datetime.strptime("05:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
+
+    application.add_error_handler(global_error_handler)
 
     application.run_polling()
 
