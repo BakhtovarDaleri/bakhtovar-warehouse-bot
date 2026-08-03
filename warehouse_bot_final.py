@@ -2688,7 +2688,12 @@ async def generate_feedback_response(feedback_type: str, text_content: str, rati
                 resp.raise_for_status()
                 data = resp.json()
                 return "".join(block.get("text", "") for block in data.get("content", [])).strip()
-            except (httpx.HTTPError, httpx.TransportError) as e:
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.warning(f"Claude API попытка {attempt+1}/3 не удалась: {e.response.status_code} {e.response.text}")
+                if e.response.status_code < 500:
+                    break  # клиентская ошибка (400/401/403) — повтор того же запроса не поможет
+            except httpx.TransportError as e:
                 last_error = e
                 logger.warning(f"Claude API попытка {attempt+1}/3 не удалась: {e}")
     raise last_error
