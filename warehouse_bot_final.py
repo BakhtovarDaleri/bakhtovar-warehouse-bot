@@ -2790,16 +2790,21 @@ async def process_new_feedback_item(db: "SupabaseService", context: ContextTypes
     await send_feedback_for_approval(context, db, row["id"])
 
 
-async def _run_ozon_feedback_sync(db: "SupabaseService", context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str) -> int:
+async def _run_ozon_feedback_sync(db: "SupabaseService", context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str) -> tuple:
+    """Возвращает (успешно_обработано, ошибок) — счётчики раздельные, чтобы не репортить ложный успех."""
     rows = await collect_new_feedback_rows(db, OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
     db.insert_ozon_feedback_batch(rows)
     new_items = db.get_new_ozon_feedback()
+    success_count = 0
+    error_count = 0
     for item in new_items:
         try:
             await process_new_feedback_item(db, context, item)
-        except Exception as e:
-            logger.error(f"Ошибка обработки отзыва/вопроса id={item.get('id')} ozon_id={item.get('ozon_id')}: {e}")
-    return len(new_items)
+            success_count += 1
+        except Exception:
+            error_count += 1
+            logger.exception(f"Ошибка обработки отзыва/вопроса id={item.get('id')} ozon_id={item.get('ozon_id')}")
+    return success_count, error_count
 
 
 async def run_ozon_feedback_sync_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2814,12 +2819,14 @@ async def run_ozon_feedback_sync_job(context: ContextTypes.DEFAULT_TYPE):
     date_to = datetime.now(TZ_MSK).date().isoformat()
     date_from = (datetime.now(TZ_MSK).date() - timedelta(days=2)).isoformat()
     try:
-        count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
-        if count:
-            logger.info(f"Ozon feedback sync: обработано {count} новых отзывов/вопросов")
-    except Exception as e:
-        logger.error(f"Ozon feedback sync failed: {e}")
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации отзывов/вопросов Ozon: {e}")
+        success_count, error_count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
+        if success_count or error_count:
+            logger.info(f"Ozon feedback sync: обработано {success_count}, ошибок {error_count}")
+        if error_count:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Синхронизация отзывов/вопросов Ozon: обработано {success_count}, ошибок {error_count} (детали — в логах).")
+    except Exception:
+        logger.exception("Ozon feedback sync failed")
+        await context.bot.send_message(chat_id=ADMIN_ID, text="⚠️ Ошибка синхронизации отзывов/вопросов Ozon (детали — в логах).")
     finally:
         context.bot_data["ozon_feedback_sync_running"] = False
 
@@ -2832,9 +2839,16 @@ async def _run_ozon_feedback_sync_and_reply(update: Update, context: ContextType
     await update.message.reply_text(f"🔄 Проверяю отзывы и вопросы Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     db = context.bot_data.get("db")
     try:
-        count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
-        await update.message.reply_text(f"✅ Готово: найдено и обработано {count} новых отзывов/вопросов за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        success_count, error_count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
+        if error_count:
+            await update.message.reply_text(
+                f"⚠️ За {date_from} — {date_to}: обработано {success_count}, ошибок {error_count}. Подробности — в логах бота.",
+                reply_markup=get_main_menu_keyboard(update.effective_user.id),
+            )
+        else:
+            await update.message.reply_text(f"✅ Готово: обработано {success_count} новых отзывов/вопросов за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     except Exception as e:
+        logger.exception("Ручная синхронизация отзывов/вопросов Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     finally:
         context.bot_data["ozon_feedback_sync_running"] = False
