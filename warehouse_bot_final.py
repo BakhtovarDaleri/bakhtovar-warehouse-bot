@@ -34,6 +34,14 @@ OZON_BULAT_CLIENT_ID = os.getenv("OZON_BULAT_CLIENT_ID", "")
 OZON_BULAT_API_KEY = os.getenv("OZON_BULAT_API_KEY", "")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 
+# Anthropic (Claude) API — генерация ответов на отзывы/вопросы Ozon
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages"
+
+# Как часто фоново проверять новые отзывы/вопросы Ozon (минуты)
+OZON_FEEDBACK_SYNC_MINUTES = int(os.getenv("OZON_FEEDBACK_SYNC_MINUTES", "45"))
+
 TZ_MSK = zoneinfo.ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -387,6 +395,32 @@ class SupabaseService:
             return
         self.client.table("ozon_transactions").upsert(rows, on_conflict="ozon_operation_id").execute()
 
+    # --- Ozon отзывы/вопросы ---
+    def get_existing_ozon_feedback_ids(self, ozon_ids: list) -> set:
+        """Какие из этих ozon_id уже есть в базе — чтобы не вставлять дубли и не затирать статус уже обработанных."""
+        if not ozon_ids:
+            return set()
+        res = self.client.table("ozon_feedback").select("ozon_id").in_("ozon_id", ozon_ids).execute()
+        return {r["ozon_id"] for r in (res.data or [])}
+
+    def insert_ozon_feedback_batch(self, rows: list):
+        """Вставка ТОЛЬКО новых записей (status='new') — вызывающий код уже отфильтровал дубли по ozon_id."""
+        if not rows:
+            return
+        self.client.table("ozon_feedback").insert(rows).execute()
+
+    def get_new_ozon_feedback(self):
+        res = self.client.table("ozon_feedback").select("*").eq("status", "new").execute()
+        return res.data or []
+
+    def update_ozon_feedback(self, feedback_id, **fields):
+        self.client.table("ozon_feedback").update(fields).eq("id", feedback_id).execute()
+
+    def get_ozon_feedback(self, feedback_id):
+        res = self.client.table("ozon_feedback").select("*").eq("id", feedback_id).limit(1).execute()
+        data = res.data or []
+        return data[0] if data else None
+
     def get_warehouse_activity_history(self):
         """Единая история всех действий по складу: постоянные расходы, логистика, отгрузки — по датам вместе."""
         items = []
@@ -674,6 +708,9 @@ PROFIT_PERIOD = "PROFIT_PERIOD"
 PROFIT_PERIOD_CUSTOM = "PROFIT_PERIOD_CUSTOM"
 OZON_SYNC_PERIOD = "OZON_SYNC_PERIOD"
 OZON_SYNC_PERIOD_CUSTOM = "OZON_SYNC_PERIOD_CUSTOM"
+OZON_FEEDBACK_SYNC_PERIOD = "OZON_FEEDBACK_SYNC_PERIOD"
+OZON_FEEDBACK_SYNC_PERIOD_CUSTOM = "OZON_FEEDBACK_SYNC_PERIOD_CUSTOM"
+FEEDBACK_EDIT_TEXT = "FEEDBACK_EDIT_TEXT"
 
 
 
@@ -701,7 +738,7 @@ def get_main_menu_keyboard(user_id):
     kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
-        kb.append(["🔄 Синхр. Ozon"])
+        kb.append(["🔄 Синхр. Ozon", "🔄 Синхр. отзывы"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -2541,6 +2578,385 @@ async def ozon_sync_period_custom(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+# --- OZON ОТЗЫВЫ И ВОПРОСЫ (Reviews & Questions) ---
+async def _ozon_api_post(client_id: str, api_key: str, path: str, body: dict) -> dict:
+    """Общий POST к Ozon Seller API с ретраями — как в fetch_ozon_transactions."""
+    headers = {"Client-Id": client_id, "Api-Key": api_key, "Content-Type": "application/json"}
+    last_error = None
+    async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
+        for attempt in range(3):
+            try:
+                resp = await http.post(f"{OZON_API_BASE}{path}", headers=headers, json=body)
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.HTTPError, httpx.TransportError) as e:
+                last_error = e
+                logger.warning(f"Ozon API попытка {attempt+1}/3 не удалась ({path}): {e}")
+    raise last_error
+
+
+async def fetch_ozon_reviews(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
+    """Список отзывов за период. Точные поля пагинации/фильтра сверим на первом реальном запуске."""
+    all_reviews = []
+    last_id = ""
+    while True:
+        data = await _ozon_api_post(client_id, api_key, "/v1/review/list", {
+            "last_id": last_id, "limit": 100, "sort_dir": "ASC",
+        })
+        result = data.get("result") or data
+        reviews = result.get("reviews", [])
+        reviews = [r for r in reviews if date_from <= (r.get("published_at") or "")[:10] <= date_to]
+        all_reviews.extend(reviews)
+        last_id = result.get("last_id", "")
+        if not result.get("has_next") or not last_id:
+            break
+    return all_reviews
+
+
+async def fetch_ozon_review_info(client_id: str, api_key: str, review_id) -> dict:
+    """Полная карточка отзыва: текст, фото, видео, рейтинг, sku, автор."""
+    data = await _ozon_api_post(client_id, api_key, "/v1/review/info", {"review_id": review_id})
+    return data.get("result") or data
+
+
+async def fetch_ozon_questions(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
+    """Список вопросов покупателей за период."""
+    all_questions = []
+    last_id = ""
+    while True:
+        data = await _ozon_api_post(client_id, api_key, "/v1/question/list", {
+            "last_id": last_id, "limit": 100,
+            "filter": {"date_from": f"{date_from}T00:00:00.000Z", "date_to": f"{date_to}T23:59:59.000Z"},
+        })
+        result = data.get("result") or data
+        questions = result.get("questions", [])
+        all_questions.extend(questions)
+        last_id = result.get("last_id", "")
+        if not result.get("has_next") or not last_id:
+            break
+    return all_questions
+
+
+async def publish_ozon_review_comment(client_id: str, api_key: str, review_id, text: str):
+    await _ozon_api_post(client_id, api_key, "/v1/review/comment/create", {
+        "review_id": review_id, "text": text, "mark_review_as_processed": True,
+    })
+
+
+async def publish_ozon_question_answer(client_id: str, api_key: str, question_id, sku, text: str):
+    await _ozon_api_post(client_id, api_key, "/v1/question/answer/create", {
+        "question_id": question_id, "sku": sku, "text": text,
+    })
+
+
+def _review_has_media(info: dict) -> bool:
+    photos = info.get("photos") or info.get("photos_amount") or []
+    videos = info.get("videos") or info.get("videos_amount") or []
+    photos_count = len(photos) if isinstance(photos, list) else int(photos or 0)
+    videos_count = len(videos) if isinstance(videos, list) else int(videos or 0)
+    return photos_count > 0 or videos_count > 0
+
+
+async def generate_feedback_response(feedback_type: str, text_content: str, rating=None, product_hint: str = None) -> str:
+    """Индивидуальный ответ через Claude — заново под конкретный текст, без подстановки в шаблон."""
+    kind_label = "отзыв на товар" if feedback_type == "review" else "вопрос покупателя о товаре"
+    rating_line = f"Оценка покупателя: {rating}/5.\n" if rating is not None else ""
+    product_line = f"Товар: {product_hint}.\n" if product_hint else ""
+    system_prompt = (
+        "Ты — представитель бренда на маркетплейсе Ozon, отвечаешь покупателям от лица магазина. "
+        "Пиши по-русски, тепло и по-человечески, обращайся к конкретным деталям, которые упомянул покупатель — "
+        "не используй шаблонные фразы вроде 'Спасибо за отзыв, нам важно ваше мнение'. "
+        "Если это негативный отзыв или жалоба — извинись по существу и предложи решение (написать в поддержку/на замену). "
+        "Если это вопрос — ответь по существу; если в тексте недостаточно данных для точного ответа, честно скажи, "
+        "что уточнишь детали, и предложи написать в личные сообщения магазина. "
+        "Ответ короткий (2-5 предложений), без markdown-разметки, без подписи в конце."
+    )
+    user_prompt = f"{product_line}{rating_line}Текст покупателя ({kind_label}):\n{text_content or '(текста нет)'}"
+
+    headers = {"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": 400,
+        "system": system_prompt,
+        "messages": [{"role": "user", "content": user_prompt}],
+    }
+    last_error = None
+    async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
+        for attempt in range(3):
+            try:
+                resp = await http.post(ANTHROPIC_API_BASE, headers=headers, json=body)
+                resp.raise_for_status()
+                data = resp.json()
+                return "".join(block.get("text", "") for block in data.get("content", [])).strip()
+            except (httpx.HTTPError, httpx.TransportError) as e:
+                last_error = e
+                logger.warning(f"Claude API попытка {attempt+1}/3 не удалась: {e}")
+    raise last_error
+
+
+def _build_feedback_row(feedback_type: str, ozon_id, sku, rating, author_name, text_content, raw_json: dict) -> dict:
+    return {
+        "feedback_type": feedback_type,
+        "ozon_id": str(ozon_id),
+        "sku": sku,
+        "rating": rating,
+        "author_name": author_name,
+        "text_content": text_content,
+        "status": "new",
+        "raw_json": raw_json,
+    }
+
+
+async def collect_new_feedback_rows(db: "SupabaseService", client_id: str, api_key: str, date_from: str, date_to: str) -> list:
+    """Тянет отзывы и вопросы за период, отбрасывает уже сохранённые (по ozon_id) — возвращает строки для insert."""
+    candidates = []
+    for r in await fetch_ozon_reviews(client_id, api_key, date_from, date_to):
+        candidates.append(("review", r))
+    for q in await fetch_ozon_questions(client_id, api_key, date_from, date_to):
+        candidates.append(("question", q))
+
+    all_ids = [str(item.get("id") if kind == "review" else item.get("question_id")) for kind, item in candidates]
+    existing_ids = db.get_existing_ozon_feedback_ids(all_ids)
+
+    rows = []
+    for kind, item in candidates:
+        ozon_id = str(item.get("id") if kind == "review" else item.get("question_id"))
+        if ozon_id in existing_ids:
+            continue
+        if kind == "review":
+            info = await fetch_ozon_review_info(client_id, api_key, item.get("id"))
+            rows.append(_build_feedback_row(
+                "review", ozon_id, info.get("sku") or item.get("sku"), info.get("rating") or item.get("rating"),
+                info.get("author_name") or info.get("user_name") or item.get("author_name"),
+                info.get("text") or item.get("text"), {"list": item, "info": info},
+            ))
+        else:
+            rows.append(_build_feedback_row(
+                "question", ozon_id, item.get("sku"), None,
+                item.get("author_name") or item.get("user_name"), item.get("text"), item,
+            ))
+    return rows
+
+
+def _feedback_preview_text(row: dict, response_text: str) -> str:
+    kind_label = "⭐ Отзыв" if row["feedback_type"] == "review" else "❓ Вопрос"
+    rating_line = f"\nОценка: {row.get('rating')}/5" if row.get("rating") is not None else ""
+    return (
+        f"{kind_label} на Ozon{rating_line}\n"
+        f"👤 {row.get('author_name') or 'Аноним'}\n"
+        f"📦 SKU: {row.get('sku') or '—'}\n\n"
+        f"💬 Текст покупателя:\n{row.get('text_content') or '(без текста)'}\n\n"
+        f"🤖 Черновик ответа:\n{response_text}"
+    )
+
+
+def _feedback_approval_keyboard(feedback_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Опубликовать", callback_data=f"ozfb_pub_{feedback_id}"),
+        InlineKeyboardButton("✏️ Править", callback_data=f"ozfb_edit_{feedback_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"ozfb_rej_{feedback_id}"),
+    ]])
+
+
+async def send_feedback_for_approval(context: ContextTypes.DEFAULT_TYPE, db: "SupabaseService", feedback_id):
+    row = db.get_ozon_feedback(feedback_id)
+    text = _feedback_preview_text(row, row.get("draft_response") or "")
+    msg = await context.bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=_feedback_approval_keyboard(feedback_id))
+    db.update_ozon_feedback(feedback_id, status="pending_approval", telegram_message_id=msg.message_id)
+
+
+async def process_new_feedback_item(db: "SupabaseService", context: ContextTypes.DEFAULT_TYPE, row: dict):
+    feedback_type = row["feedback_type"]
+    text_content = row.get("text_content") or ""
+    rating = row.get("rating")
+
+    if feedback_type == "review" and rating is not None and rating >= 4:
+        info = (row.get("raw_json") or {}).get("info") or {}
+        has_content = bool(text_content.strip()) or _review_has_media(info)
+        if not has_content:
+            db.update_ozon_feedback(row["id"], status="skipped")
+            return
+        response_text = await generate_feedback_response("review", text_content, rating)
+        await publish_ozon_review_comment(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, row["ozon_id"], response_text)
+        db.update_ozon_feedback(
+            row["id"], status="published", draft_response=response_text,
+            final_response=response_text, published_at=datetime.now(TZ_MSK).isoformat(),
+        )
+        return
+
+    # Негативный отзыв (rating < 4) или любой вопрос — только черновик, публикация после подтверждения админом
+    response_text = await generate_feedback_response(feedback_type, text_content, rating)
+    db.update_ozon_feedback(row["id"], status="draft_ready", draft_response=response_text)
+    await send_feedback_for_approval(context, db, row["id"])
+
+
+async def _run_ozon_feedback_sync(db: "SupabaseService", context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str) -> int:
+    rows = await collect_new_feedback_rows(db, OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
+    db.insert_ozon_feedback_batch(rows)
+    new_items = db.get_new_ozon_feedback()
+    for item in new_items:
+        try:
+            await process_new_feedback_item(db, context, item)
+        except Exception as e:
+            logger.error(f"Ошибка обработки отзыва/вопроса id={item.get('id')} ozon_id={item.get('ozon_id')}: {e}")
+    return len(new_items)
+
+
+async def run_ozon_feedback_sync_job(context: ContextTypes.DEFAULT_TYPE):
+    """Плановая проверка новых отзывов/вопросов Ozon — каждые OZON_FEEDBACK_SYNC_MINUTES минут."""
+    if not (OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY and ANTHROPIC_API_KEY):
+        return
+    if context.bot_data.get("ozon_feedback_sync_running"):
+        logger.info("Ozon feedback sync: пропускаю плановый запуск — уже идёт другая синхронизация.")
+        return
+    context.bot_data["ozon_feedback_sync_running"] = True
+    db = context.bot_data.get("db")
+    date_to = datetime.now(TZ_MSK).date().isoformat()
+    date_from = (datetime.now(TZ_MSK).date() - timedelta(days=2)).isoformat()
+    try:
+        count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
+        if count:
+            logger.info(f"Ozon feedback sync: обработано {count} новых отзывов/вопросов")
+    except Exception as e:
+        logger.error(f"Ozon feedback sync failed: {e}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации отзывов/вопросов Ozon: {e}")
+    finally:
+        context.bot_data["ozon_feedback_sync_running"] = False
+
+
+async def _run_ozon_feedback_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
+    if context.bot_data.get("ozon_feedback_sync_running"):
+        await update.message.reply_text("⏳ Синхронизация отзывов уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        return
+    context.bot_data["ozon_feedback_sync_running"] = True
+    await update.message.reply_text(f"🔄 Проверяю отзывы и вопросы Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    db = context.bot_data.get("db")
+    try:
+        count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
+        await update.message.reply_text(f"✅ Готово: найдено и обработано {count} новых отзывов/вопросов за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    finally:
+        context.bot_data["ozon_feedback_sync_running"] = False
+
+
+async def ozon_feedback_sync_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Шаг 1: выбор периода ручной проверки отзывов/вопросов (только админ)."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    if not (OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY and ANTHROPIC_API_KEY):
+        await update.message.reply_text("⚠️ Ключи Ozon и/или Anthropic ещё не настроены в переменных окружения.")
+        return ConversationHandler.END
+    kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("🔄 *Синхронизация отзывов/вопросов Ozon*\n\nЗа какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
+    return OZON_FEEDBACK_SYNC_PERIOD
+
+
+async def ozon_feedback_sync_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    t_now = datetime.now(TZ_MSK)
+
+    if t == "Последние 3 дня":
+        date_from = (t_now.date() - timedelta(days=3)).isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_ozon_feedback_sync_and_reply(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if t == "Последние 30 дней":
+        date_from = (t_now.date() - timedelta(days=30)).isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_ozon_feedback_sync_and_reply(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if "Свой период" in t:
+        await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
+        return OZON_FEEDBACK_SYNC_PERIOD_CUSTOM
+
+    return OZON_FEEDBACK_SYNC_PERIOD
+
+
+async def ozon_feedback_sync_period_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try:
+        start_raw, end_raw = t.split("-")
+        start_parsed = parse_flexible_date(start_raw.strip(), TZ_MSK)
+        end_parsed = parse_flexible_date(end_raw.strip(), TZ_MSK)
+        if not start_parsed or not end_parsed:
+            raise ValueError
+        date_from, date_to = start_parsed[0], end_parsed[0]
+    except (ValueError, AttributeError):
+        await update.message.reply_text("⚠️ Не понял период. Формат: ДД.ММ-ДД.ММ, например 01.07-31.07. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return OZON_FEEDBACK_SYNC_PERIOD_CUSTOM
+
+    await _run_ozon_feedback_sync_and_reply(update, context, date_from, date_to)
+    return ConversationHandler.END
+
+
+async def feedback_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопки '✅ Опубликовать' / '❌ Отклонить' под черновиком ответа."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != ADMIN_ID:
+        return
+    _, action, feedback_id_str = query.data.split("_", 2)
+    feedback_id = int(feedback_id_str)
+    db = context.bot_data.get("db")
+    row = db.get_ozon_feedback(feedback_id)
+    if not row or row["status"] != "pending_approval":
+        await query.edit_message_text("⚠️ Эта запись уже обработана или не найдена.")
+        return
+
+    if action == "rej":
+        db.update_ozon_feedback(feedback_id, status="rejected", approved_by=str(update.effective_user.id), approved_at=datetime.now(TZ_MSK).isoformat())
+        await query.edit_message_text(query.message.text + "\n\n❌ Отклонено.")
+        return
+
+    response_text = row.get("final_response") or row.get("draft_response") or ""
+    try:
+        if row["feedback_type"] == "review":
+            await publish_ozon_review_comment(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, row["ozon_id"], response_text)
+        else:
+            await publish_ozon_question_answer(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, row["ozon_id"], row.get("sku"), response_text)
+    except Exception as e:
+        await query.edit_message_text(query.message.text + f"\n\n⚠️ Ошибка публикации в Ozon: {e}")
+        return
+
+    db.update_ozon_feedback(
+        feedback_id, status="published", final_response=response_text,
+        approved_by=str(update.effective_user.id), approved_at=datetime.now(TZ_MSK).isoformat(),
+        published_at=datetime.now(TZ_MSK).isoformat(),
+    )
+    await query.edit_message_text(query.message.text + "\n\n✅ Опубликовано.")
+
+
+async def feedback_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка '✏️ Править' — просим админа прислать новый текст ответа."""
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    feedback_id = int(query.data.split("_", 2)[2])
+    row = context.bot_data.get("db").get_ozon_feedback(feedback_id)
+    if not row or row["status"] != "pending_approval":
+        await query.edit_message_text("⚠️ Эта запись уже обработана или не найдена.")
+        return ConversationHandler.END
+    context.user_data["fb_edit_id"] = feedback_id
+    await query.message.reply_text(f"✏️ Пришлите новый текст ответа вместо:\n\n{row.get('draft_response') or ''}")
+    return FEEDBACK_EDIT_TEXT
+
+
+async def feedback_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    feedback_id = context.user_data.get("fb_edit_id")
+    new_text = update.message.text.strip()
+    db = context.bot_data.get("db")
+    db.update_ozon_feedback(feedback_id, final_response=new_text)
+    row = db.get_ozon_feedback(feedback_id)
+    await update.message.reply_text(_feedback_preview_text(row, new_text), reply_markup=_feedback_approval_keyboard(feedback_id))
+    return ConversationHandler.END
+
+
 # --- REMINDERS ---
 async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
@@ -2731,7 +3147,7 @@ def main():
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -2743,7 +3159,7 @@ def main():
             PAYMENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAYMENT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     history_conv = ConversationHandler(
@@ -2754,7 +3170,7 @@ def main():
             HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
             HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
             HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     warehouse_conv = ConversationHandler(
@@ -2791,7 +3207,7 @@ def main():
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
             EMP_ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     sale_conv = ConversationHandler(
@@ -2799,7 +3215,7 @@ def main():
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     balance_conv = ConversationHandler(
@@ -2808,7 +3224,7 @@ def main():
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
             BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
         },
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     reminder_conv = ConversationHandler(
@@ -2818,7 +3234,7 @@ def main():
             REMINDER_INPUT_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_input_flow)],
             REMINDER_DATE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_date_select)],
             REMINDER_TIME_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_select)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     add_conv = ConversationHandler(
@@ -2830,11 +3246,12 @@ def main():
             ADD_SUPPLIER_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_supplier_type)],
             ADD_PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
             ADD_PRODUCT_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_ip)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(approval_callback, pattern="^approve_"))
+    application.add_handler(CallbackQueryHandler(feedback_action_callback, pattern="^ozfb_(pub|rej)_"))
     application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     application.add_handler(supply_conv)
     application.add_handler(payment_conv)
@@ -2849,13 +3266,28 @@ def main():
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. отзывы$"), ozon_feedback_sync_start)],
+        states={
+            OZON_FEEDBACK_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period)],
+            OZON_FEEDBACK_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period_custom)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(feedback_edit_start, pattern="^ozfb_edit_")],
+        states={
+            FEEDBACK_EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_edit_text)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
         application.job_queue.run_daily(run_ozon_sync_job, time=datetime.strptime("04:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
     application.job_queue.run_daily(run_fixed_costs_job, time=datetime.strptime("05:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
+    if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY and ANTHROPIC_API_KEY:
+        application.job_queue.run_repeating(run_ozon_feedback_sync_job, interval=timedelta(minutes=OZON_FEEDBACK_SYNC_MINUTES), first=60)
 
     application.add_error_handler(global_error_handler)
 
