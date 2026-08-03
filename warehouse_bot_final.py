@@ -701,7 +701,8 @@ def get_main_menu_keyboard(user_id):
     kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "❓ Помощь"]]
     if user_id == ADMIN_ID:
         kb[3].append("⏰ Напомнить")
-        kb.append(["🔄 Синхр. Ozon"])
+        kb.append(["🔄 Синхр. Ozon", "🔍 Тест поставок Ozon"])
+        kb.append(["🔍 Тест отзывов Ozon"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -2485,6 +2486,54 @@ async def _run_ozon_sync_and_reply(update: Update, context: ContextTypes.DEFAULT
         context.bot_data["ozon_sync_running"] = False
 
 
+async def ozon_test_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разведывательная функция — проверить, работает ли доступ к API отзывов
+    (может требовать платную подписку 'Управление отзывами'/Premium Pro)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
+        await update.message.reply_text("⚠️ Ключи Ozon не настроены.")
+        return
+    await update.message.reply_text("🔍 Пробую /v1/review/list...")
+    headers = {"Client-Id": OZON_BULAT_CLIENT_ID, "Api-Key": OZON_BULAT_API_KEY, "Content-Type": "application/json"}
+    body = {"sort_dir": "DESC", "limit": 20}
+    try:
+        async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
+            resp = await http.post(f"{OZON_API_BASE}/v1/review/list", headers=headers, json=body)
+            text = resp.text
+            await update.message.reply_text(f"Статус: {resp.status_code}\n\n```\n{text[:3500]}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка запроса: {e}")
+
+
+async def ozon_test_supply_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разведывательная функция — только для понять структуру ответа /v3/supply-order/list.
+    Показывает сырой JSON (обрезанный), чтобы разобраться, какие поля реально приходят."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not OZON_BULAT_CLIENT_ID or not OZON_BULAT_API_KEY:
+        await update.message.reply_text("⚠️ Ключи Ozon не настроены.")
+        return
+    await update.message.reply_text("🔍 Пробую /v3/supply-order/list за последние 30 дней...")
+    headers = {"Client-Id": OZON_BULAT_CLIENT_ID, "Api-Key": OZON_BULAT_API_KEY, "Content-Type": "application/json"}
+    date_to = datetime.now(TZ_MSK)
+    date_from = date_to - timedelta(days=30)
+    body = {
+        "filter": {
+            "since": date_from.strftime("%Y-%m-%dT00:00:00.000Z"),
+            "to": date_to.strftime("%Y-%m-%dT23:59:59.000Z"),
+        },
+        "paging": {"from_supply_order_id": 0, "limit": 20},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
+            resp = await http.post(f"{OZON_API_BASE}/v3/supply-order/list", headers=headers, json=body)
+            text = resp.text
+            await update.message.reply_text(f"Статус: {resp.status_code}\n\n```\n{text[:3500]}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка запроса: {e}")
+
+
 async def ozon_sync_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Шаг 1: выбор периода синхронизации (только админ)."""
     if update.effective_user.id != ADMIN_ID:
@@ -2851,6 +2900,8 @@ def main():
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
         }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|❓ Помощь|⏰ Напомнить|🔄 Синхр\. Ozon)$"), cancel_to_menu)]
     ))
+    application.add_handler(MessageHandler(filters.Regex("^🔍 Тест поставок Ozon$"), ozon_test_supply_orders))
+    application.add_handler(MessageHandler(filters.Regex("^🔍 Тест отзывов Ozon$"), ozon_test_reviews))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
