@@ -2523,7 +2523,7 @@ async def ozon_test_supply_orders(update: Update, context: ContextTypes.DEFAULT_
             "since": date_from.strftime("%Y-%m-%dT00:00:00.000Z"),
             "to": date_to.strftime("%Y-%m-%dT23:59:59.000Z"),
         },
-        "paging": {"from_supply_order_id": 0, "limit": 20},
+        "limit": 20,
     }
     try:
         async with httpx.AsyncClient(timeout=30.0, http2=False) as http:
