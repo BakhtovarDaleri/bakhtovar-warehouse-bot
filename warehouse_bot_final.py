@@ -3076,12 +3076,14 @@ SKU_TO_PRODUCT_NAME = {
 
 
 async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
-    """Список поставок за период. /v2/supply-order/list — актуальный метод (старые waybill_acceptance_results
-    удалены из документации Ozon в 2023 году). Пагинация/фильтр — best-effort, сверим на первом реальном запуске."""
+    """Список поставок за период. /v2/supply-order/list вернул 404 на реальном ключе — Ozon отключил v1/v2
+    supply-order/list и /get в пользу v3 (подтверждено официальным changelog Ozon for dev, миграция с дедлайном
+    11 декабря). /v1/supply-order/bundle в этом уведомлении не упоминается, оставлен как есть.
+    Пагинация/фильтр v3 — best-effort, сверим на первом реальном запуске."""
     all_orders = []
     last_id = ""
     while True:
-        data = await _ozon_api_post(client_id, api_key, "/v2/supply-order/list", {
+        data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/list", {
             "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z"},
             "last_id": last_id, "limit": 100,
         })
