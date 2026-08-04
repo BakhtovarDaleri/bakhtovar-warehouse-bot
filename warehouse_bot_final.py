@@ -4,6 +4,7 @@ Version 7.0.0 - Migrated from Google Sheets to Supabase (Postgres)
 """
 import os
 import re
+import json
 import logging
 import httpx
 from datetime import datetime, timedelta
@@ -3099,9 +3100,11 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
     sort_by=1 подтверждён реальным ответом Ozon (следующая ошибка больше не жаловалась на SortBy).
 
     filter.states — ОБЯЗАТЕЛЬНОЕ поле (перебор в процессе, см. OZON_SUPPLY_STATES_PROBE):
-    [9999] дал "value must be one of the defined enum values" без перечисления диапазона — в отличие от
-    SortBy, тут Ozon не подсказывает границы. Перебираем по одному значению за раз ([1], [2], [3]...) через
-    переменную окружения OZON_SUPPLY_STATES_PROBE — меняется на Bothost без нового деплоя кода.
+    states=[1..11] прошли валидацию (states=[12] — первое невалидное), но запрос вернул 0 поставок за 30 дней,
+    хотя бизнес активно отгружает на Ozon — подозрительно. Добавлено временное диагностическое логирование
+    сырого ответа (см. ниже) — проверяем: (а) действительно ли orders пуст, или (б) мы читаем не те ключи
+    ответа (result/supply_orders/orders/items — тоже best-effort для v3), и заодно (в) не перепутаны ли имена
+    полей фильтра по датам (filter.since/filter.to — тоже не подтверждены документацией для v3).
     ⚠️ ВРЕМЕННЫЙ ЗОНД — не финальное значение, требует замены по результату реального запроса."""
     all_orders = []
     last_id = ""
@@ -3110,6 +3113,9 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
             "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": OZON_SUPPLY_STATES_PROBE},
             "sort_by": 1, "last_id": last_id, "limit": 100,
         })
+        # ВРЕМЕННАЯ ДИАГНОСТИКА: сырой ответ целиком, до любого парсинга ключей — проверяем, действительно ли
+        # список пуст, или мы просто не туда смотрим (result/supply_orders/orders/items могут называться иначе в v3).
+        logger.info(f"[DIAG] /v3/supply-order/list сырой ответ: {json.dumps(data, ensure_ascii=False)[:4000]}")
         result = data.get("result") or data
         orders = result.get("supply_orders") or result.get("orders") or result.get("items") or []
         all_orders.extend(orders)
