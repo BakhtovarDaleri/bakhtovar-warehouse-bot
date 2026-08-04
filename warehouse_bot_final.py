@@ -42,6 +42,12 @@ ANTHROPIC_API_BASE = "https://api.anthropic.com/v1/messages"
 # Как часто фоново проверять новые отзывы/вопросы Ozon (минуты)
 OZON_FEEDBACK_SYNC_MINUTES = int(os.getenv("OZON_FEEDBACK_SYNC_MINUTES", "45"))
 
+# ВРЕМЕННЫЙ ПОДБОР: допустимые значения filter.states для /v3/supply-order/list ещё не найдены в документации.
+# Меняйте это значение прямо в переменных окружения Bothost между попытками (без нового деплоя кода) —
+# один перезапуск процесса вместо полного цикла код -> PR -> мерж -> деплой. Убрать после того, как найдём
+# реальный диапазон допустимых значений states.
+OZON_SUPPLY_STATES_PROBE = [int(x) for x in os.getenv("OZON_SUPPLY_STATES_PROBE", "1").split(",") if x.strip()]
+
 TZ_MSK = zoneinfo.ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -3092,17 +3098,16 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
 
     sort_by=1 подтверждён реальным ответом Ozon (следующая ошибка больше не жаловалась на SortBy).
 
-    filter.states — ОБЯЗАТЕЛЬНОЕ поле, подтверждено реальной ошибкой:
-    "invalid SupplyOrderListRequest_Filter.States: value must contain at least 1 item(s)".
-    Значение [9999] — заведомо нереальный зонд: если Ozon в ответ перечислит допустимый диапазон/значения
-    в тексте ошибки (как это было с SortBy), возьмём точное значение оттуда; если нет — следующий шаг —
-    диапазон [1..10] по одному элементу за раз, чтобы бинарным/линейным поиском по ошибкам сузить границы.
+    filter.states — ОБЯЗАТЕЛЬНОЕ поле (перебор в процессе, см. OZON_SUPPLY_STATES_PROBE):
+    [9999] дал "value must be one of the defined enum values" без перечисления диапазона — в отличие от
+    SortBy, тут Ozon не подсказывает границы. Перебираем по одному значению за раз ([1], [2], [3]...) через
+    переменную окружения OZON_SUPPLY_STATES_PROBE — меняется на Bothost без нового деплоя кода.
     ⚠️ ВРЕМЕННЫЙ ЗОНД — не финальное значение, требует замены по результату реального запроса."""
     all_orders = []
     last_id = ""
     while True:
         data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/list", {
-            "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": [9999]},
+            "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": OZON_SUPPLY_STATES_PROBE},
             "sort_by": 1, "last_id": last_id, "limit": 100,
         })
         result = data.get("result") or data
