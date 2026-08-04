@@ -2581,6 +2581,9 @@ async def ozon_sync_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
         return OZON_SYNC_PERIOD_CUSTOM
 
+    this_month_start = t_now.replace(day=1).strftime("%d.%m")
+    kb = [["Последние 30 дней"], [f"Этот месяц (с {this_month_start})"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("⚠️ Не понял выбор. Нажмите один из вариантов на клавиатуре:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return OZON_SYNC_PERIOD
 
 
@@ -2979,6 +2982,8 @@ async def ozon_feedback_sync_period(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
         return OZON_FEEDBACK_SYNC_PERIOD_CUSTOM
 
+    kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("⚠️ Не понял выбор. Нажмите один из вариантов на клавиатуре:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return OZON_FEEDBACK_SYNC_PERIOD
 
 
@@ -3254,6 +3259,8 @@ async def ozon_supply_sync_period(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
         return OZON_SUPPLY_SYNC_PERIOD_CUSTOM
 
+    kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("⚠️ Не понял выбор. Нажмите один из вариантов на клавиатуре:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return OZON_SUPPLY_SYNC_PERIOD
 
 
