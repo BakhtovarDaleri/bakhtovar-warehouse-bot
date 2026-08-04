@@ -2637,6 +2637,16 @@ async def fetch_ozon_questions(client_id: str, api_key: str, date_from: str, dat
     return all_questions
 
 
+async def fetch_ozon_product_names(client_id: str, api_key: str, skus: list) -> dict:
+    """Названия товаров по SKU — одним батч-запросом. Точные поля сверим на первом реальном запуске."""
+    unique_skus = list({s for s in skus if s})
+    if not unique_skus:
+        return {}
+    data = await _ozon_api_post(client_id, api_key, "/v3/product/info/list", {"sku": unique_skus})
+    items = data.get("items") or (data.get("result") or {}).get("items") or []
+    return {item.get("sku"): item.get("name") for item in items if item.get("sku")}
+
+
 async def publish_ozon_review_comment(client_id: str, api_key: str, review_id, text: str):
     await _ozon_api_post(client_id, api_key, "/v1/review/comment/create", {
         "review_id": review_id, "text": text, "mark_review_as_processed": True,
@@ -2665,17 +2675,37 @@ async def generate_feedback_response(feedback_type: str, text_content: str, rati
     system_prompt = (
         "Ты — представитель бренда на маркетплейсе Ozon, отвечаешь покупателям от лица магазина. "
         "Пиши по-русски, спокойно и по-деловому, обращайся к конкретным деталям, которые упомянул покупатель — "
-        "не используй шаблонные фразы вроде 'Спасибо за отзыв, нам важно ваше мнение'.\n\n"
+        "не используй шаблонные фразы вроде 'Спасибо за отзыв, нам важно ваше мнение'. Всегда начинай ответ с "
+        "короткого приветствия ('Здравствуйте!' или 'Добрый день!') — и в положительных отзывах, и в "
+        "отрицательных, и в ответах на вопросы. Длина ответа — примерно 4 предложения, не длиннее и не короче.\n\n"
+        "СПРАВОЧНИК ПО ТОВАРАМ (только для твоего понимания при формулировке ответа — никогда не заявляй эти "
+        "факты прямо и категорично покупателю, это читают и другие покупатели, формулируй мягко и по существу):\n"
+        "- Чернослив: маслянистая/влажная поверхность — естественная характеристика сухофрукта, не дефект.\n"
+        "- Изюм Малаяр: 100% чистый натуральный состав. Если жалуются на масло — не подтверждай и не отрицай "
+        "его наличие явно и прямо, отвечай нейтрально про натуральность состава.\n"
+        "- Изюм Терма: 100% чистый натуральный состав, масла в составе нет.\n"
+        "- Боярышник: 100% чистый натуральный состав.\n"
+        "- Шиповник: 100% чистый натуральный состав.\n"
+        "- Фасоль: 100% чистый натуральный состав.\n"
+        "Для Терма, Боярышника, Шиповника и Фасоли масла в составе нет — если покупатель жалуется на масло "
+        "именно по этим товарам, это НЕ спишешь на естественную характеристику, это повод разобраться как с "
+        "реальной проблемой (см. пункт 1 ниже).\n\n"
         "Если это негативный отзыв или жалоба на товар, сначала определи её тип:\n"
         "1) РЕАЛЬНЫЙ БРАК ИЛИ ПРОБЛЕМА КАЧЕСТВА — товар испорчен, плесень, инородный предмет, прислали не тот "
-        "товар, повреждённая упаковка при доставке и т.п. В этом случае признай проблему и предложи написать "
-        "в чат магазина для замены или возврата.\n"
-        "2) ЕСТЕСТВЕННЫЕ ХАРАКТЕРИСТИКИ СУХОФРУКТОВ, которые покупатель может принять за недостаток — например, "
-        "масляная/влажная поверхность у чернослива, естественный сахарный налёт на кураге/изюме, вариативность "
-        "размера и формы плодов (натуральный продукт, не откалиброванный по ГОСТу как конфеты), и подобное. "
-        "Для этого типа: не извиняйся, как будто это наша ошибка; не отрицай сам факт, если он "
-        "действительно есть (не говори 'масла нет', если оно есть); не заостряй на этом лишнее внимание и не "
-        "оправдывайся; спокойно и по-деловому объясни, что это особенность продукта или технологии обработки. "
+        "товар, повреждённая упаковка при доставке, а также жалоба на характеристику, которой по справочнику "
+        "выше не должно быть у этого товара. Признай проблему и извинись по существу, но НЕ обещай конкретный "
+        "исход (не пиши 'оформим возврат' или 'заменим товар') — предложи написать в личные сообщения магазина "
+        "с фото товара и номером заказа, чтобы разобраться и помочь; решение по возврату или замене "
+        "обсуждается уже там. Ориентируйся на тон и длину этого примера (не копируй дословно, формулируй "
+        "заново под конкретный отзыв): 'Здравствуйте! Очень жаль это слышать, такого точно быть не должно, "
+        "приносим извинения за некачественную партию. Пожалуйста, напишите нам в личные сообщения магазина с "
+        "фото товара и номером заказа — разберёмся и поможем. Хотим понять, что пошло не так, и исправить "
+        "ситуацию.'\n"
+        "2) ЕСТЕСТВЕННЫЕ ХАРАКТЕРИСТИКИ ТОВАРА, которые покупатель может принять за недостаток (см. справочник "
+        "выше) — например, вариативность размера и формы плодов (натуральный продукт, не откалиброванный по "
+        "ГОСТу как конфеты), и подобное. Для этого типа: не извиняйся, как будто это наша ошибка; не отрицай "
+        "сам факт, если он действительно есть, но и не подтверждай его прямо и категорично; не заостряй на "
+        "этом лишнее внимание и не оправдывайся; спокойно и по-деловому объясни, что это особенность продукта. "
         "НЕ предлагай возврат или замену по умолчанию для этого типа — только если покупатель сам явно просит "
         "вернуть товар.\n\n"
         "Общий принцип: если жалоба основана на неверном представлении о характеристиках продукта — вежливо, но "
@@ -2683,7 +2713,7 @@ async def generate_feedback_response(feedback_type: str, text_content: str, rati
         "'клиент всегда прав' там, где покупатель просто не так понял свойства товара.\n\n"
         "Если это вопрос — ответь по существу; если в тексте недостаточно данных для точного ответа, честно скажи, "
         "что уточнишь детали, и предложи написать в личные сообщения магазина.\n\n"
-        "Ответ короткий (2-5 предложений), без markdown-разметки, без подписи в конце."
+        "Без markdown-разметки, без подписи в конце."
     )
     user_prompt = f"{product_line}{rating_line}Текст покупателя ({kind_label}):\n{text_content or '(текста нет)'}"
 
@@ -2713,7 +2743,7 @@ async def generate_feedback_response(feedback_type: str, text_content: str, rati
     raise last_error
 
 
-def _build_feedback_row(feedback_type: str, ozon_id, sku, rating, author_name, text_content, raw_json: dict) -> dict:
+def _build_feedback_row(feedback_type: str, ozon_id, sku, rating, author_name, text_content, product_name, raw_json: dict) -> dict:
     return {
         "feedback_type": feedback_type,
         "ozon_id": str(ozon_id),
@@ -2721,6 +2751,7 @@ def _build_feedback_row(feedback_type: str, ozon_id, sku, rating, author_name, t
         "rating": rating,
         "author_name": author_name,
         "text_content": text_content,
+        "product_name": product_name,
         "status": "new",
         "raw_json": raw_json,
     }
@@ -2736,23 +2767,40 @@ async def collect_new_feedback_rows(db: "SupabaseService", client_id: str, api_k
 
     all_ids = [str(item.get("id") if kind == "review" else item.get("question_id")) for kind, item in candidates]
     existing_ids = db.get_existing_ozon_feedback_ids(all_ids)
+    new_candidates = [
+        (kind, item) for kind, item in candidates
+        if str(item.get("id") if kind == "review" else item.get("question_id")) not in existing_ids
+    ]
+
+    review_infos = {}
+    for kind, item in new_candidates:
+        if kind == "review":
+            review_infos[item.get("id")] = await fetch_ozon_review_info(client_id, api_key, item.get("id"))
+
+    skus = set()
+    for kind, item in new_candidates:
+        sku = (review_infos[item.get("id")].get("sku") if kind == "review" else item.get("sku")) or item.get("sku")
+        if sku:
+            skus.add(sku)
+    product_names = await fetch_ozon_product_names(client_id, api_key, list(skus))
 
     rows = []
-    for kind, item in candidates:
+    for kind, item in new_candidates:
         ozon_id = str(item.get("id") if kind == "review" else item.get("question_id"))
-        if ozon_id in existing_ids:
-            continue
         if kind == "review":
-            info = await fetch_ozon_review_info(client_id, api_key, item.get("id"))
+            info = review_infos[item.get("id")]
+            sku = info.get("sku") or item.get("sku")
             rows.append(_build_feedback_row(
-                "review", ozon_id, info.get("sku") or item.get("sku"), info.get("rating") or item.get("rating"),
+                "review", ozon_id, sku, info.get("rating") or item.get("rating"),
                 info.get("author_name") or info.get("user_name") or item.get("author_name"),
-                info.get("text") or item.get("text"), {"list": item, "info": info},
+                info.get("text") or item.get("text"), product_names.get(sku), {"list": item, "info": info},
             ))
         else:
+            sku = item.get("sku")
             rows.append(_build_feedback_row(
-                "question", ozon_id, item.get("sku"), None,
-                item.get("author_name") or item.get("user_name"), item.get("text"), item,
+                "question", ozon_id, sku, None,
+                item.get("author_name") or item.get("user_name"), item.get("text"),
+                product_names.get(sku), item,
             ))
     return rows
 
@@ -2760,10 +2808,11 @@ async def collect_new_feedback_rows(db: "SupabaseService", client_id: str, api_k
 def _feedback_preview_text(row: dict, response_text: str) -> str:
     kind_label = "⭐ Отзыв" if row["feedback_type"] == "review" else "❓ Вопрос"
     rating_line = f"\nОценка: {row.get('rating')}/5" if row.get("rating") is not None else ""
+    product_label = row.get("product_name") or (f"SKU {row['sku']}" if row.get("sku") else "—")
     return (
         f"{kind_label} на Ozon{rating_line}\n"
         f"👤 {row.get('author_name') or 'Аноним'}\n"
-        f"📦 SKU: {row.get('sku') or '—'}\n\n"
+        f"📦 Товар: {product_label}\n\n"
         f"💬 Текст покупателя:\n{row.get('text_content') or '(без текста)'}\n\n"
         f"🤖 Черновик ответа:\n{response_text}"
     )
@@ -2795,7 +2844,7 @@ async def process_new_feedback_item(db: "SupabaseService", context: ContextTypes
         if not has_content:
             db.update_ozon_feedback(row["id"], status="skipped")
             return
-        response_text = await generate_feedback_response("review", text_content, rating)
+        response_text = await generate_feedback_response("review", text_content, rating, row.get("product_name"))
         await publish_ozon_review_comment(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, row["ozon_id"], response_text)
         db.update_ozon_feedback(
             row["id"], status="published", draft_response=response_text,
@@ -2804,7 +2853,7 @@ async def process_new_feedback_item(db: "SupabaseService", context: ContextTypes
         return
 
     # Негативный отзыв (rating < 4) или любой вопрос — только черновик, публикация после подтверждения админом
-    response_text = await generate_feedback_response(feedback_type, text_content, rating)
+    response_text = await generate_feedback_response(feedback_type, text_content, rating, row.get("product_name"))
     db.update_ozon_feedback(row["id"], status="draft_ready", draft_response=response_text)
     await send_feedback_for_approval(context, db, row["id"])
 
