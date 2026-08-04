@@ -3089,16 +3089,20 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
     """Список поставок за период. /v2/supply-order/list вернул 404 на реальном ключе — Ozon отключил v1/v2
     supply-order/list и /get в пользу v3 (подтверждено официальным changelog Ozon for dev, миграция с дедлайном
     11 декабря). /v1/supply-order/bundle в этом уведомлении не упоминается, оставлен как есть.
-    v3 затем вернул 400: "invalid SupplyOrderListRequest.SortBy: value must not be in list [0]" — поле sort_by
-    обязательно и не может быть 0 (protobuf enum, 0 обычно = "не указано"). Значение 1 — предположение по
-    конвенции Ozon (первое реальное значение enum'а), точный список допустимых значений не найден в открытой
-    документации (docs.ozon.ru недоступен для прямой проверки) — сверим по факту следующего реального запуска.
-    Остальная пагинация/фильтр v3 тоже best-effort."""
+
+    sort_by=1 подтверждён реальным ответом Ozon (следующая ошибка больше не жаловалась на SortBy).
+
+    filter.states — ОБЯЗАТЕЛЬНОЕ поле, подтверждено реальной ошибкой:
+    "invalid SupplyOrderListRequest_Filter.States: value must contain at least 1 item(s)".
+    Значение [9999] — заведомо нереальный зонд: если Ozon в ответ перечислит допустимый диапазон/значения
+    в тексте ошибки (как это было с SortBy), возьмём точное значение оттуда; если нет — следующий шаг —
+    диапазон [1..10] по одному элементу за раз, чтобы бинарным/линейным поиском по ошибкам сузить границы.
+    ⚠️ ВРЕМЕННЫЙ ЗОНД — не финальное значение, требует замены по результату реального запроса."""
     all_orders = []
     last_id = ""
     while True:
         data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/list", {
-            "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z"},
+            "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": [9999]},
             "sort_by": 1, "last_id": last_id, "limit": 100,
         })
         result = data.get("result") or data
