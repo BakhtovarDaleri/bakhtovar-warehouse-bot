@@ -2616,7 +2616,12 @@ async def _ozon_api_post(client_id: str, api_key: str, path: str, body: dict) ->
                 resp = await http.post(f"{OZON_API_BASE}{path}", headers=headers, json=body)
                 resp.raise_for_status()
                 return resp.json()
-            except (httpx.HTTPError, httpx.TransportError) as e:
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                logger.warning(f"Ozon API попытка {attempt+1}/3 не удалась ({path}): {e.response.status_code} {e.response.text}")
+                if e.response.status_code < 500:
+                    break  # клиентская ошибка (400/401/403) — повтор того же запроса не поможет
+            except httpx.TransportError as e:
                 last_error = e
                 logger.warning(f"Ozon API попытка {attempt+1}/3 не удалась ({path}): {e}")
     raise last_error
