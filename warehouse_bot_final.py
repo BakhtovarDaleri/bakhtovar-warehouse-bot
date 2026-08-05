@@ -3092,6 +3092,9 @@ SKU_TO_PRODUCT_NAME = {
 }
 
 
+_DEBUG_LAST_SUPPLY_ORDER_RESPONSE = None  # ВРЕМЕННО (отладка 0-результата /v3/supply-order/list) — убрать вместе с блоком ниже
+
+
 async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
     """Список поставок за период. /v2/supply-order/list вернул 404 на реальном ключе — Ozon отключил v1/v2
     supply-order/list и /get в пользу v3 (подтверждено официальным changelog Ozon for dev, миграция с дедлайном
@@ -3101,11 +3104,14 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
 
     filter.states — ОБЯЗАТЕЛЬНОЕ поле (перебор в процессе, см. OZON_SUPPLY_STATES_PROBE):
     states=[1..11] прошли валидацию (states=[12] — первое невалидное), но запрос вернул 0 поставок за 30 дней,
-    хотя бизнес активно отгружает на Ozon — подозрительно. Добавлено временное диагностическое логирование
-    сырого ответа (см. ниже) — проверяем: (а) действительно ли orders пуст, или (б) мы читаем не те ключи
-    ответа (result/supply_orders/orders/items — тоже best-effort для v3), и заодно (в) не перепутаны ли имена
-    полей фильтра по датам (filter.since/filter.to — тоже не подтверждены документацией для v3).
+    хотя бизнес активно отгружает на Ozon — подозрительно. Сырой ответ временно кладём в
+    _DEBUG_LAST_SUPPLY_ORDER_RESPONSE и показываем прямо в сообщении Telegram (см. _run_ozon_supply_sync_and_reply)
+    — поход в логи Bothost оказался слишком медленным для итерации. Проверяем: (а) действительно ли orders
+    пуст, или (б) мы читаем не те ключи ответа (result/supply_orders/orders/items — тоже best-effort для v3),
+    и заодно (в) не перепутаны ли имена полей фильтра по датам (filter.since/filter.to — тоже не подтверждены
+    документацией для v3).
     ⚠️ ВРЕМЕННЫЙ ЗОНД — не финальное значение, требует замены по результату реального запроса."""
+    global _DEBUG_LAST_SUPPLY_ORDER_RESPONSE
     all_orders = []
     last_id = ""
     while True:
@@ -3113,9 +3119,7 @@ async def fetch_ozon_supply_orders(client_id: str, api_key: str, date_from: str,
             "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": OZON_SUPPLY_STATES_PROBE},
             "sort_by": 1, "last_id": last_id, "limit": 100,
         })
-        # ВРЕМЕННАЯ ДИАГНОСТИКА: сырой ответ целиком, до любого парсинга ключей — проверяем, действительно ли
-        # список пуст, или мы просто не туда смотрим (result/supply_orders/orders/items могут называться иначе в v3).
-        logger.info(f"[DIAG] /v3/supply-order/list сырой ответ: {json.dumps(data, ensure_ascii=False)[:4000]}")
+        _DEBUG_LAST_SUPPLY_ORDER_RESPONSE = data  # ВРЕМЕННО — см. комментарий выше
         result = data.get("result") or data
         orders = result.get("supply_orders") or result.get("orders") or result.get("items") or []
         all_orders.extend(orders)
@@ -3235,17 +3239,25 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
     try:
         stats = await _run_ozon_supply_acceptance_sync(db, date_from, date_to)
         status_line = ", ".join(f"{k}: {v}" for k, v in stats["status_counts"].items()) or "—"
+        # ВРЕМЕННО: сырой ответ Ozon прямо в сообщении бота — одной кнопкой, без похода в логи Bothost.
+        debug_raw = json.dumps(_DEBUG_LAST_SUPPLY_ORDER_RESPONSE, ensure_ascii=False)[:700] if _DEBUG_LAST_SUPPLY_ORDER_RESPONSE else "(нет данных)"
         await update.message.reply_text(
             f"✅ Приёмки за {date_from} — {date_to} (из {stats['total']} строк):\n"
             f"списано {stats['processed']}, уже было {stats['skipped_dup']}, "
             f"неизвестный SKU {stats['skipped_unknown_sku']}, нулевое кол-во {stats['skipped_zero_qty']}, "
             f"ошибок {stats['errors']}.\n\n"
-            f"📋 Статусы поставок (сырые, для проверки фильтра): {status_line}",
+            f"📋 Статусы поставок (сырые, для проверки фильтра): {status_line}\n\n"
+            f"🐞 DEBUG сырой ответ Ozon (временно, первые 700 символов):\n{debug_raw}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
-        await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        # ВРЕМЕННО: та же отладочная врезка на случай ошибки — вдруг запрос всё же успел дойти до ответа.
+        debug_raw = json.dumps(_DEBUG_LAST_SUPPLY_ORDER_RESPONSE, ensure_ascii=False)[:700] if _DEBUG_LAST_SUPPLY_ORDER_RESPONSE else "(нет данных — запрос не дошёл до ответа)"
+        await update.message.reply_text(
+            f"⚠️ Ошибка синхронизации: {e}\n\n🐞 DEBUG последний сырой ответ Ozon (временно): {debug_raw}",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
