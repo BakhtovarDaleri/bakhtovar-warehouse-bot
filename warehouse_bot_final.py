@@ -3122,7 +3122,13 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     global _DEBUG_LAST_SUPPLY_GET_RESPONSE
     if not order_ids:
         return []
-    data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": order_ids})
+    try:
+        data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": order_ids})
+    except httpx.HTTPStatusError as e:
+        # ВРЕМЕННО: тело ошибки тоже кладём в debug-переменную — иначе при 400/... сюда так и не доходит
+        # успешный data, и /get-дамп в Telegram не отправляется вообще (что и произошло на первом запросе).
+        _DEBUG_LAST_SUPPLY_GET_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}
+        raise
     _DEBUG_LAST_SUPPLY_GET_RESPONSE = data  # ВРЕМЕННО
     result = data.get("result") or data
     return result.get("orders") or result.get("supply_orders") or result.get("items") or []
