@@ -3116,22 +3116,34 @@ async def fetch_ozon_supply_order_ids(client_id: str, api_key: str, date_from: s
     return data.get("order_ids") or (data.get("result") or {}).get("order_ids") or []
 
 
+SUPPLY_ORDER_GET_CHUNK_SIZE = 50  # подтверждено реальной ошибкой: OrderIds принимает от 1 до 50 элементов включительно
+
+
 async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_ids: list) -> list:
     """Детали поставок по ID через /v3/supply-order/get (та же схема ключа "order_ids", что подтвердилась
-    у /list — берём по аналогии, форма ответа пока НЕ проверена). ⚠️ best-effort, сверим по факту запроса."""
+    у /list). Бьём на чанки по SUPPLY_ORDER_GET_CHUNK_SIZE — 76 ID одним запросом дали 400
+    "OrderIds: value must contain between 1 and 50 items, inclusive". Форма самого ответа (какие поля
+    внутри каждой поставки) пока НЕ проверена — best-effort, сверим по факту первого успешного запроса."""
     global _DEBUG_LAST_SUPPLY_GET_RESPONSE
     if not order_ids:
         return []
-    try:
-        data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": order_ids})
-    except httpx.HTTPStatusError as e:
-        # ВРЕМЕННО: тело ошибки тоже кладём в debug-переменную — иначе при 400/... сюда так и не доходит
-        # успешный data, и /get-дамп в Telegram не отправляется вообще (что и произошло на первом запросе).
-        _DEBUG_LAST_SUPPLY_GET_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}
-        raise
-    _DEBUG_LAST_SUPPLY_GET_RESPONSE = data  # ВРЕМЕННО
-    result = data.get("result") or data
-    return result.get("orders") or result.get("supply_orders") or result.get("items") or []
+    all_orders = []
+    debug_chunks = []
+    for i in range(0, len(order_ids), SUPPLY_ORDER_GET_CHUNK_SIZE):
+        chunk = order_ids[i:i + SUPPLY_ORDER_GET_CHUNK_SIZE]
+        try:
+            data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": chunk})
+        except httpx.HTTPStatusError as e:
+            # ВРЕМЕННО: тело ошибки тоже кладём в debug-переменную — иначе при 400/... сюда так и не доходит
+            # успешный data, и /get-дамп в Telegram не отправляется вообще.
+            debug_chunks.append({"http_status": e.response.status_code, "body": e.response.text})
+            _DEBUG_LAST_SUPPLY_GET_RESPONSE = debug_chunks  # ВРЕМЕННО
+            raise
+        debug_chunks.append(data)
+        result = data.get("result") or data
+        all_orders.extend(result.get("orders") or result.get("supply_orders") or result.get("items") or [])
+    _DEBUG_LAST_SUPPLY_GET_RESPONSE = debug_chunks  # ВРЕМЕННО
+    return all_orders
 
 
 async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, order_id) -> list:
