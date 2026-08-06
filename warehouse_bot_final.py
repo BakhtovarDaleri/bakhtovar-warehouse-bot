@@ -3095,6 +3095,7 @@ SKU_TO_PRODUCT_NAME = {
 # ВРЕМЕННО (отладка /v3/supply-order/list и /get) — сырые ответы для показа в Telegram, убрать вместе с блоком ниже
 _DEBUG_LAST_SUPPLY_LIST_RESPONSE = None
 _DEBUG_LAST_SUPPLY_GET_RESPONSE = None
+_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
 
 
 async def fetch_ozon_supply_order_ids(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
@@ -3146,38 +3147,53 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     return all_orders
 
 
-async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, order_id) -> list:
-    """Состав поставки по SKU через /v1/supply-order/bundle. Поле с фактическим количеством не подтверждено —
-    сверим на первом реальном запросе (пробуем несколько вероятных имён полей)."""
-    data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"supply_order_id": order_id})
+async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, bundle_id) -> list:
+    """Состав поставки по SKU через /v1/supply-order/bundle. Реальный ответ /v3/supply-order/get показал, что
+    один order содержит МАССИВ supplies, и у каждой supply есть свой bundle_id (UUID) — совпадение имени
+    поля с именем эндпоинта /bundle слишком показательное, чтобы не проверить в первую очередь (раньше сюда
+    ошибочно передавался order_id верхнего уровня, отсюда и 400). Поле с фактическим количеством в ответе
+    ещё не подтверждено — сверим по факту первого успешного запроса."""
+    global _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
+    try:
+        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_id": bundle_id})
+    except httpx.HTTPStatusError as e:
+        _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}  # ВРЕМЕННО
+        raise
+    _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = data  # ВРЕМЕННО
     result = data.get("result") or data
     return result.get("items") or result.get("bundle") or []
 
 
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
-    """Возвращает (lines, status_counts). Фильтр по статусу поставки сознательно НЕ делаем — статус пока не
-    проверен на реальных данных, поэтому просто собираем сырую статистику по статусам и показываем админу,
-    чтобы решить вместе, какие статусы считать 'завершено', вместо того чтобы гадать заранее."""
+    """Возвращает (lines, status_counts). Единица приёмки — ОТДЕЛЬНАЯ supply внутри order (не сам order):
+    у order может быть несколько supplies, у каждой свой supply_id/bundle_id/state. supply_number для дедупа
+    и списания — supply_id (не order_id и не order_number, которые общие на весь order).
+    Фильтр по статусу сознательно НЕ делаем — реальное значение "state" (например "COMPLETED") уже видели
+    в ответе /get, но собираем сырую статистику и показываем админу, чтобы решить вместе, что считать
+    'завершено', вместо того чтобы гадать заранее."""
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
     lines = []
     status_counts = {}
     for order in orders:
-        order_id = order.get("supply_order_id") or order.get("order_id") or order.get("id")
-        supply_number = str(order.get("supply_order_number") or order.get("order_number") or order_id)
-        raw_status = order.get("status") or order.get("state") or "неизвестно"
-        status_counts[raw_status] = status_counts.get(raw_status, 0) + 1
-
-        items = await fetch_ozon_supply_order_bundle(client_id, api_key, order_id)
-        for item in items:
-            sku = item.get("sku")
-            accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
-            if sku is None or accepted_qty is None:
+        for supply in order.get("supplies") or []:
+            supply_id = supply.get("supply_id")
+            bundle_id = supply.get("bundle_id")
+            raw_status = supply.get("state") or order.get("state") or "неизвестно"
+            status_counts[raw_status] = status_counts.get(raw_status, 0) + 1
+            if not bundle_id:
                 continue
-            lines.append({
-                "supply_number": supply_number, "sku": sku, "accepted_qty": accepted_qty,
-                "raw_json": {"order": order, "item": item, "order_status": raw_status},
-            })
+
+            items = await fetch_ozon_supply_order_bundle(client_id, api_key, bundle_id)
+            for item in items:
+                sku = item.get("sku")
+                accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
+                if sku is None or accepted_qty is None:
+                    continue
+                lines.append({
+                    "supply_number": str(supply_id), "sku": sku, "accepted_qty": accepted_qty,
+                    "raw_json": {"order_id": order.get("order_id"), "supply": supply, "item": item, "state": raw_status},
+                })
     return lines, status_counts
 
 
@@ -3256,6 +3272,9 @@ async def _send_supply_debug_dumps(update: Update):
     if _DEBUG_LAST_SUPPLY_GET_RESPONSE is not None:
         raw = json.dumps(_DEBUG_LAST_SUPPLY_GET_RESPONSE, ensure_ascii=False)[:3500]
         await update.message.reply_text(f"🐞 DEBUG /v3/supply-order/get сырой ответ (первые 3500 симв.):\n{raw}")
+    if _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE is not None:
+        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE, ensure_ascii=False)[:3500]
+        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle сырой ответ (первые 3500 симв.):\n{raw}")
 
 
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
