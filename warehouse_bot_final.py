@@ -3133,13 +3133,6 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
 
 SUPPLY_BUNDLE_PAUSE_SECONDS = 0.4  # пауза между вызовами — подстраховка сверх retry на 429 в _ozon_api_post
 
-# ВРЕМЕННО: полный проход по ВСЕЙ выборке (не сэмпл) — уникальные значения shipment_type/sfbo_attribute
-# по каждому item, плюс кросс-таблица против order_tags.is_super_fbo с уровня заказа, чтобы понять, это
-# один и тот же сигнал или два разных. Убрать вместе с блоком в _run_ozon_supply_sync_and_reply, как
-# только определимся, по какому полю различать короб/монопалет и на каком уровне хранить кластер.
-_DEBUG_FIELD_VALUE_COUNTS = {"shipment_type": {}, "sfbo_attribute": {}}
-_DEBUG_SFBO_CROSSTAB = {}  # {(order_is_super_fbo, item_sfbo_attribute): count}
-
 
 async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: list) -> dict:
     """Состав поставок по SKU через /v1/supply-order/bundle — по ОДНОМУ bundle_id за запрос.
@@ -3166,7 +3159,6 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     Обрабатываем только supplies с state == SUPPLY_ORDER_COMPLETED_STATE ("COMPLETED", подтверждено реальным
     ответом) — и на уровне order, и на уровне supply. status_counts всё равно считаем по всем supplies
     (включая незавершённые), чтобы в отчёте админу было видно полную картину, а не только обработанное."""
-    global _DEBUG_FIELD_VALUE_COUNTS, _DEBUG_SFBO_CROSSTAB
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
 
@@ -3174,7 +3166,6 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     completed_supplies = []
     for order in orders:
         order_state = order.get("state") or "неизвестно"
-        order_is_super_fbo = (order.get("order_tags") or {}).get("is_super_fbo")
         for supply in order.get("supplies") or []:
             supply_state = supply.get("state") or "неизвестно"
             status_counts[supply_state] = status_counts.get(supply_state, 0) + 1
@@ -3184,21 +3175,13 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
             bundle_id = supply.get("bundle_id")
             if not supply_id or not bundle_id:
                 continue
-            completed_supplies.append((supply_id, bundle_id, order.get("order_id"), order_is_super_fbo))
+            completed_supplies.append((supply_id, bundle_id, order.get("order_id")))
 
-    items_by_bundle = await fetch_ozon_supply_bundles(client_id, api_key, [b for _, b, _, _ in completed_supplies])
+    items_by_bundle = await fetch_ozon_supply_bundles(client_id, api_key, [b for _, b, _ in completed_supplies])
 
     lines = []
-    for supply_id, bundle_id, order_id, order_is_super_fbo in completed_supplies:
+    for supply_id, bundle_id, order_id in completed_supplies:
         for item in items_by_bundle.get(bundle_id, []):
-            # ВРЕМЕННО: полный скан, не сэмпл
-            shipment_type = item.get("shipment_type")
-            sfbo_attribute = item.get("sfbo_attribute")
-            _DEBUG_FIELD_VALUE_COUNTS["shipment_type"][shipment_type] = _DEBUG_FIELD_VALUE_COUNTS["shipment_type"].get(shipment_type, 0) + 1
-            _DEBUG_FIELD_VALUE_COUNTS["sfbo_attribute"][sfbo_attribute] = _DEBUG_FIELD_VALUE_COUNTS["sfbo_attribute"].get(sfbo_attribute, 0) + 1
-            crosstab_key = (order_is_super_fbo, sfbo_attribute)
-            _DEBUG_SFBO_CROSSTAB[crosstab_key] = _DEBUG_SFBO_CROSSTAB.get(crosstab_key, 0) + 1
-
             sku = item.get("sku")
             accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
             if sku is None or accepted_qty is None:
@@ -3276,22 +3259,6 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
-async def _send_supply_bundle_items_debug_dump(update: Update):
-    """ВРЕМЕННО: уникальные значения shipment_type/sfbo_attribute по ВСЕЙ выборке (не сэмпл), плюс
-    кросс-таблица order_tags.is_super_fbo (заказ) × sfbo_attribute (позиция) — сверяем, один это сигнал
-    или два разных. Убрать вместе с _DEBUG_FIELD_VALUE_COUNTS/_DEBUG_SFBO_CROSSTAB."""
-    if not any(_DEBUG_FIELD_VALUE_COUNTS.values()) and not _DEBUG_SFBO_CROSSTAB:
-        return
-    lines = ["🐞 DEBUG — уникальные значения по всей выборке:"]
-    for field, counts in _DEBUG_FIELD_VALUE_COUNTS.items():
-        values_str = ", ".join(f"{v!r}: {c}" for v, c in sorted(counts.items(), key=lambda x: -x[1]))
-        lines.append(f"{field}: {values_str or '—'}")
-    lines.append("\nis_super_fbo (заказ) × sfbo_attribute (позиция):")
-    for (order_flag, item_attr), count in sorted(_DEBUG_SFBO_CROSSTAB.items(), key=lambda x: -x[1]):
-        lines.append(f"is_super_fbo={order_flag!r} × sfbo_attribute={item_attr!r}: {count}")
-    await update.message.reply_text("\n".join(lines)[:3500])
-
-
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3310,11 +3277,9 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
-        await _send_supply_bundle_items_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-        await _send_supply_bundle_items_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
