@@ -3127,11 +3127,26 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     return all_orders
 
 
+# ВРЕМЕННО: supply_id тоже дал 400 на /v1/supply-order/bundle — кладём запрос и ответ для показа в Telegram
+_DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = None
+_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
+
+
 async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, supply_id) -> list:
     """Состав поставки по SKU через /v1/supply-order/bundle, по supply_id конкретной supply (не order_id —
     у одного order может быть несколько supplies, у каждой свой независимый состав). Поле с фактическим
-    количеством в ответе ещё не подтверждено — сверим по факту первого успешного запроса."""
-    data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"supply_id": supply_id})
+    количеством в ответе ещё не подтверждено — сверим по факту первого успешного запроса.
+    ⚠️ ВРЕМЕННО: supply_id тоже дал 400 — см. _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST/_RESPONSE и
+    _run_ozon_supply_sync_and_reply, убрать вместе после того, как найдём рабочий формат запроса."""
+    global _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
+    body = {"supply_id": supply_id}
+    _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = body  # ВРЕМЕННО
+    try:
+        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", body)
+    except httpx.HTTPStatusError as e:
+        _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}  # ВРЕМЕННО
+        raise
+    _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = data  # ВРЕМЕННО
     result = data.get("result") or data
     return result.get("items") or result.get("bundle") or []
 
@@ -3237,6 +3252,17 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
+async def _send_supply_bundle_debug_dump(update: Update):
+    """ВРЕМЕННО: запрос и сырой ответ /v1/supply-order/bundle прямо в Telegram — supply_id тоже дал 400,
+    нужно увидеть точный текст без похода в логи Bothost. Убрать вместе с _DEBUG_LAST_SUPPLY_BUNDLE_*."""
+    if _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST is not None:
+        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, ensure_ascii=False)[:2000]
+        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle — что отправили:\n{raw}")
+    if _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE is not None:
+        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE, ensure_ascii=False)[:3500]
+        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle — что вернул Ozon:\n{raw}")
+
+
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3255,9 +3281,11 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
+        await _send_supply_bundle_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await _send_supply_bundle_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
