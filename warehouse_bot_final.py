@@ -5,6 +5,7 @@ Version 7.0.0 - Migrated from Google Sheets to Supabase (Postgres)
 import os
 import re
 import json
+import asyncio
 import logging
 import httpx
 from datetime import datetime, timedelta
@@ -2626,6 +2627,9 @@ async def _ozon_api_post(client_id: str, api_key: str, path: str, body: dict) ->
             except httpx.HTTPStatusError as e:
                 last_error = e
                 logger.warning(f"Ozon API попытка {attempt+1}/3 не удалась ({path}): {e.response.status_code} {e.response.text}")
+                if e.response.status_code == 429:
+                    await asyncio.sleep(2.5)  # rate limit — увеличенная пауза перед повтором, не как обычная 4xx
+                    continue
                 if e.response.status_code < 500:
                     break  # клиентская ошибка (400/401/403) — повтор того же запроса не поможет
             except httpx.TransportError as e:
@@ -3127,32 +3131,38 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     return all_orders
 
 
-# ВРЕМЕННО: подтверждено реальной ошибкой ("invalid GetSupplyOrderBundleRequest.BundleIds: value must
-# contain between 1 and 1000 items, inclusive") — поле называется BundleIds, массив, и ждёт bundle_id
-# (UUID-строку из supplies[]), а не supply_id (число). Держим DEBUG ещё на один прогон — вдруг опять 400.
-_DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = None
-_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
+SUPPLY_BUNDLE_CHUNK_SIZE = 30  # батч bundle_ids за один запрос (метод принимает массив, до 1000) — меньше вызовов
+SUPPLY_BUNDLE_PAUSE_SECONDS = 0.4  # пауза между батч-запросами — подстраховка сверх retry на 429 в _ozon_api_post
 
 
-async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, bundle_id) -> list:
-    """Состав поставки по SKU через /v1/supply-order/bundle — {"bundle_ids": [bundle_id], "limit": 100}, где
-    bundle_id — UUID-строка из supplies[i]["bundle_id"] (не supply_id и не order_id). limit обязателен,
-    подтверждено реальной ошибкой ("Limit: value must be inside range (0, 100]") — 100 (максимум) на один
-    bundle_id с запасом, без пагинации. Поле с фактическим количеством в ответе ещё не подтверждено —
-    сверим по факту первого успешного запроса.
-    ⚠️ ВРЕМЕННО: см. _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST/_RESPONSE и _run_ozon_supply_sync_and_reply,
-    убрать вместе после того, как подтвердим и формат запроса, и форму ответа."""
-    global _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
-    body = {"bundle_ids": [bundle_id], "limit": 100}
-    _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = body  # ВРЕМЕННО
-    try:
-        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", body)
-    except httpx.HTTPStatusError as e:
-        _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}  # ВРЕМЕННО
-        raise
-    _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = data  # ВРЕМЕННО
-    result = data.get("result") or data
-    return result.get("items") or result.get("bundle") or result.get("bundles") or []
+async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: list) -> dict:
+    """Состав поставок по SKU через /v1/supply-order/bundle, батчами по SUPPLY_BUNDLE_CHUNK_SIZE bundle_ids
+    за запрос — {"bundle_ids": [...], "limit": 100}, оба поля подтверждены реальными ошибками валидации.
+    Возвращает {bundle_id: [items]}.
+    ⚠️ Группировка результата по bundle_id при батче из НЕСКОЛЬКИХ id не подтверждена реальным ответом —
+    тестировали только запрос с одним bundle_id. Если Ozon не группирует явно (ищем ключи bundles/results),
+    а батч больше 1 — намеренно падаем с понятной ошибкой вместо угадывания: неверное сопоставление
+    товар→поставка на списании склада может задвоить или перепутать данные, это хуже, чем упасть и
+    посмотреть на реальные ключи ответа в тексте ошибки."""
+    result_by_bundle = {}
+    for i in range(0, len(bundle_ids), SUPPLY_BUNDLE_CHUNK_SIZE):
+        chunk = bundle_ids[i:i + SUPPLY_BUNDLE_CHUNK_SIZE]
+        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_ids": chunk, "limit": 100})
+        result = data.get("result") or data
+        bundles = result.get("bundles") or result.get("results")
+        if bundles:
+            for b in bundles:
+                result_by_bundle[b.get("bundle_id")] = b.get("items") or []
+        elif len(chunk) == 1:
+            result_by_bundle[chunk[0]] = result.get("items") or result.get("bundle") or []
+        else:
+            raise RuntimeError(
+                f"/v1/supply-order/bundle не вернул явную группировку по bundle_id для батча из {len(chunk)} — "
+                f"нельзя безопасно сопоставить товары с конкретными поставками. Ключи ответа: {list(result.keys())}"
+            )
+        if i + SUPPLY_BUNDLE_CHUNK_SIZE < len(bundle_ids):
+            await asyncio.sleep(SUPPLY_BUNDLE_PAUSE_SECONDS)
+    return result_by_bundle
 
 
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
@@ -3164,8 +3174,9 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     (включая незавершённые), чтобы в отчёте админу было видно полную картину, а не только обработанное."""
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
-    lines = []
+
     status_counts = {}
+    completed_supplies = []
     for order in orders:
         order_state = order.get("state") or "неизвестно"
         for supply in order.get("supplies") or []:
@@ -3177,17 +3188,21 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
             bundle_id = supply.get("bundle_id")
             if not supply_id or not bundle_id:
                 continue
+            completed_supplies.append((supply_id, bundle_id, order.get("order_id")))
 
-            items = await fetch_ozon_supply_order_bundle(client_id, api_key, bundle_id)
-            for item in items:
-                sku = item.get("sku")
-                accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
-                if sku is None or accepted_qty is None:
-                    continue
-                lines.append({
-                    "supply_number": str(supply_id), "sku": sku, "accepted_qty": accepted_qty,
-                    "raw_json": {"order_id": order.get("order_id"), "supply": supply, "item": item, "state": supply_state},
-                })
+    items_by_bundle = await fetch_ozon_supply_bundles(client_id, api_key, [b for _, b, _ in completed_supplies])
+
+    lines = []
+    for supply_id, bundle_id, order_id in completed_supplies:
+        for item in items_by_bundle.get(bundle_id, []):
+            sku = item.get("sku")
+            accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
+            if sku is None or accepted_qty is None:
+                continue
+            lines.append({
+                "supply_number": str(supply_id), "sku": sku, "accepted_qty": accepted_qty,
+                "raw_json": {"order_id": order_id, "supply_id": supply_id, "bundle_id": bundle_id, "item": item},
+            })
     return lines, status_counts
 
 
@@ -3257,17 +3272,6 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
-async def _send_supply_bundle_debug_dump(update: Update):
-    """ВРЕМЕННО: запрос и сырой ответ /v1/supply-order/bundle прямо в Telegram — supply_id тоже дал 400,
-    нужно увидеть точный текст без похода в логи Bothost. Убрать вместе с _DEBUG_LAST_SUPPLY_BUNDLE_*."""
-    if _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST is not None:
-        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, ensure_ascii=False)[:2000]
-        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle — что отправили:\n{raw}")
-    if _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE is not None:
-        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE, ensure_ascii=False)[:3500]
-        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle — что вернул Ozon:\n{raw}")
-
-
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3286,11 +3290,9 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
-        await _send_supply_bundle_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-        await _send_supply_bundle_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
