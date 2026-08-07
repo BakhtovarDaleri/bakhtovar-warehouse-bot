@@ -3152,6 +3152,11 @@ async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: li
     return result_by_bundle
 
 
+_DEBUG_ORDER_SAMPLE = None  # ВРЕМЕННО: первый COMPLETED order целиком (с одной supply) — ищем реальные
+# имена полей даты отгрузки/приёмки и кластера, мы их ни разу не видели живьём. Убрать вместе с
+# _send_supply_order_sample_debug_dump после того, как поля найдены и перенесены в схему/код синка.
+
+
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
     """Возвращает (lines, status_counts). Единица приёмки — ОТДЕЛЬНАЯ supply внутри order (не сам order):
     у order может быть несколько supplies, у каждой свой supply_id/state. supply_number для дедупа и
@@ -3159,6 +3164,7 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     Обрабатываем только supplies с state == SUPPLY_ORDER_COMPLETED_STATE ("COMPLETED", подтверждено реальным
     ответом) — и на уровне order, и на уровне supply. status_counts всё равно считаем по всем supplies
     (включая незавершённые), чтобы в отчёте админу было видно полную картину, а не только обработанное."""
+    global _DEBUG_ORDER_SAMPLE
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
 
@@ -3175,6 +3181,10 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
             bundle_id = supply.get("bundle_id")
             if not supply_id or not bundle_id:
                 continue
+            if _DEBUG_ORDER_SAMPLE is None:
+                sample = dict(order)
+                sample["supplies"] = [supply]  # только эта supply — чтобы не тащить весь список в дамп
+                _DEBUG_ORDER_SAMPLE = sample
             completed_supplies.append((supply_id, bundle_id, order.get("order_id")))
 
     items_by_bundle = await fetch_ozon_supply_bundles(client_id, api_key, [b for _, b, _ in completed_supplies])
@@ -3259,6 +3269,17 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
+async def _send_supply_order_sample_debug_dump(update: Update):
+    """ВРЕМЕННО: полный JSON одного COMPLETED order (с одной supply внутри) — ищем реальные имена
+    полей даты отгрузки/приёмки и кластера. Убрать вместе с _DEBUG_ORDER_SAMPLE, как только поля
+    найдены и перенесены в миграцию/код синка."""
+    if _DEBUG_ORDER_SAMPLE is None:
+        return
+    text = "🐞 DEBUG — пример order целиком (одна supply):\n" + json.dumps(_DEBUG_ORDER_SAMPLE, ensure_ascii=False, indent=2, default=str)
+    for i in range(0, len(text), 3900):
+        await update.message.reply_text(text[i:i + 3900])
+
+
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3277,9 +3298,11 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
+        await _send_supply_order_sample_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await _send_supply_order_sample_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
