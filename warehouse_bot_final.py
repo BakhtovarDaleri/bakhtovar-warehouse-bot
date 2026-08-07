@@ -3127,19 +3127,21 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     return all_orders
 
 
-# ВРЕМЕННО: supply_id тоже дал 400 на /v1/supply-order/bundle — кладём запрос и ответ для показа в Telegram
+# ВРЕМЕННО: подтверждено реальной ошибкой ("invalid GetSupplyOrderBundleRequest.BundleIds: value must
+# contain between 1 and 1000 items, inclusive") — поле называется BundleIds, массив, и ждёт bundle_id
+# (UUID-строку из supplies[]), а не supply_id (число). Держим DEBUG ещё на один прогон — вдруг опять 400.
 _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = None
 _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
 
 
-async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, supply_id) -> list:
-    """Состав поставки по SKU через /v1/supply-order/bundle, по supply_id конкретной supply (не order_id —
-    у одного order может быть несколько supplies, у каждой свой независимый состав). Поле с фактическим
-    количеством в ответе ещё не подтверждено — сверим по факту первого успешного запроса.
-    ⚠️ ВРЕМЕННО: supply_id тоже дал 400 — см. _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST/_RESPONSE и
-    _run_ozon_supply_sync_and_reply, убрать вместе после того, как найдём рабочий формат запроса."""
+async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, bundle_id) -> list:
+    """Состав поставки по SKU через /v1/supply-order/bundle — {"bundle_ids": [bundle_id]}, где bundle_id —
+    UUID-строка из supplies[i]["bundle_id"] (не supply_id и не order_id). Поле с фактическим количеством
+    в ответе ещё не подтверждено — сверим по факту первого успешного запроса.
+    ⚠️ ВРЕМЕННО: см. _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST/_RESPONSE и _run_ozon_supply_sync_and_reply,
+    убрать вместе после того, как подтвердим и формат запроса, и форму ответа."""
     global _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
-    body = {"supply_id": supply_id}
+    body = {"bundle_ids": [bundle_id]}
     _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = body  # ВРЕМЕННО
     try:
         data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", body)
@@ -3148,7 +3150,7 @@ async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, supply_id
         raise
     _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = data  # ВРЕМЕННО
     result = data.get("result") or data
-    return result.get("items") or result.get("bundle") or []
+    return result.get("items") or result.get("bundle") or result.get("bundles") or []
 
 
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
@@ -3170,10 +3172,11 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
             if order_state != SUPPLY_ORDER_COMPLETED_STATE or supply_state != SUPPLY_ORDER_COMPLETED_STATE:
                 continue
             supply_id = supply.get("supply_id")
-            if not supply_id:
+            bundle_id = supply.get("bundle_id")
+            if not supply_id or not bundle_id:
                 continue
 
-            items = await fetch_ozon_supply_order_bundle(client_id, api_key, supply_id)
+            items = await fetch_ozon_supply_order_bundle(client_id, api_key, bundle_id)
             for item in items:
                 sku = item.get("sku")
                 accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
