@@ -3199,9 +3199,6 @@ async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: li
     return result_by_bundle
 
 
-_DEBUG_DATE_STATE_SAMPLE = None  # ВРЕМЕННО: см. collect_supply_acceptance_lines
-
-
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
     """Возвращает (lines, status_counts). Единица приёмки — ОТДЕЛЬНАЯ supply внутри order (не сам order):
     у order может быть несколько supplies, у каждой свой supply_id/state. supply_number для дедупа и
@@ -3211,15 +3208,9 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     (включая незавершённые), чтобы в отчёте админу было видно полную картину, а не только обработанное.
 
     shipment_date/supply_completed_at/cluster подтверждены живыми данными: order.created_date,
-    supply.state_updated_date (именно на уровне supply, не order — они могут отличаться между supplies
-    одного заказа) и supply.macrolocal_cluster_id.
-
-    ВРЕМЕННО: supply.state_updated_date оказался пустым у ВСЕХ 257 сохранённых строк — подозреваем,
-    что имя поля не то (например, относится только к order, а не к supply, и совпало по названию
-    случайно). Пока не найдём реальное поле, дублируем в _DEBUG_DATE_STATE_SAMPLE ключи order/supply,
-    содержащие "date"/"state", плюс полный список всех top-level ключей обоих объектов — убрать вместе
-    с _send_date_state_debug_dump, как только поле найдено."""
-    global _DEBUG_DATE_STATE_SAMPLE
+    order.state_updated_date, supply.macrolocal_cluster_id. У supply НЕТ собственного поля даты вообще
+    (подтверждено полным списком ключей объекта) — дата приёмки берётся с order и общая для всех его
+    supplies, это не баг, а факт устройства API."""
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
 
@@ -3228,6 +3219,7 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
     for order in orders:
         order_state = order.get("state") or "неизвестно"
         shipment_date = order.get("created_date")
+        supply_completed_at = order.get("state_updated_date")
         for supply in order.get("supplies") or []:
             supply_state = supply.get("state") or "неизвестно"
             status_counts[supply_state] = status_counts.get(supply_state, 0) + 1
@@ -3237,17 +3229,9 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
             bundle_id = supply.get("bundle_id")
             if not supply_id or not bundle_id:
                 continue
-            if _DEBUG_DATE_STATE_SAMPLE is None or supply_id == 2000059372804:
-                _DEBUG_DATE_STATE_SAMPLE = {
-                    "supply_id": supply_id, "order_id": order.get("order_id"),
-                    "order_date_state_fields": {k: v for k, v in order.items() if k != "supplies" and ("date" in k.lower() or "state" in k.lower())},
-                    "supply_date_state_fields": {k: v for k, v in supply.items() if "date" in k.lower() or "state" in k.lower()},
-                    "order_all_keys": [k for k in order.keys() if k != "supplies"],
-                    "supply_all_keys": list(supply.keys()),
-                }
             completed_supplies.append((
                 supply_id, bundle_id, order.get("order_id"), shipment_date,
-                supply.get("state_updated_date"), supply.get("macrolocal_cluster_id"),
+                supply_completed_at, supply.get("macrolocal_cluster_id"),
             ))
 
     items_by_bundle = await fetch_ozon_supply_bundles(client_id, api_key, [b for _, b, _, _, _, _ in completed_supplies])
@@ -3337,8 +3321,11 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
 
 async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_id: str, api_key: str) -> int:
     """Одноразовый бэкафилл shipment_date/supply_completed_at/cluster для строк, сохранённых до того,
-    как эти поля стали синкаться. Идемпотентно (выбирает только строки с cluster IS NULL), поэтому
-    безопасно вызывать на каждом прогоне — на пустой выборке просто ничего не делает."""
+    как эти поля стали синкаться. Идемпотентно (выбирает только строки с supply_completed_at IS NULL),
+    поэтому безопасно вызывать на каждом прогоне — на пустой выборке просто ничего не делает.
+
+    supply_completed_at = order.state_updated_date — у supply нет собственного поля даты вообще
+    (подтверждено полным списком ключей), дата общая для всех supplies одного заказа."""
     rows = db.get_supply_acceptances_missing_extra_fields()
     if not rows:
         return 0
@@ -3354,11 +3341,12 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
     supply_lookup = {}
     for order in orders:
         shipment_date = order.get("created_date")
+        supply_completed_at = order.get("state_updated_date")
         for supply in order.get("supplies") or []:
             supply_id = supply.get("supply_id")
             if supply_id is None:
                 continue
-            supply_lookup[str(supply_id)] = (shipment_date, supply.get("state_updated_date"), supply.get("macrolocal_cluster_id"))
+            supply_lookup[str(supply_id)] = (shipment_date, supply_completed_at, supply.get("macrolocal_cluster_id"))
 
     updated = 0
     for supply_number in order_id_by_supply:
@@ -3369,17 +3357,6 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
         db.update_supply_acceptance_extra_fields(supply_number, shipment_date, supply_completed_at, cluster)
         updated += 1
     return updated
-
-
-async def _send_date_state_debug_dump(update: Update):
-    """ВРЕМЕННО: см. _DEBUG_DATE_STATE_SAMPLE в collect_supply_acceptance_lines. Убрать вместе с
-    глобальной переменной и её захватом, как только реальное поле даты приёмки найдено."""
-    if _DEBUG_DATE_STATE_SAMPLE is None:
-        await update.message.reply_text("🐞 DEBUG: ни одной COMPLETED supply не найдено в этом прогоне — сэмпл не захвачен.")
-        return
-    text = "🐞 DEBUG — поля date/state в order и supply:\n" + json.dumps(_DEBUG_DATE_STATE_SAMPLE, ensure_ascii=False, indent=2, default=str)
-    for i in range(0, len(text), 3900):
-        await update.message.reply_text(text[i:i + 3900])
 
 
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
@@ -3403,11 +3380,9 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"{backfill_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
-        await _send_date_state_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-        await _send_date_state_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
