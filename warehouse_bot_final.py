@@ -3135,13 +3135,15 @@ _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
 
 
 async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, bundle_id) -> list:
-    """Состав поставки по SKU через /v1/supply-order/bundle — {"bundle_ids": [bundle_id]}, где bundle_id —
-    UUID-строка из supplies[i]["bundle_id"] (не supply_id и не order_id). Поле с фактическим количеством
-    в ответе ещё не подтверждено — сверим по факту первого успешного запроса.
+    """Состав поставки по SKU через /v1/supply-order/bundle — {"bundle_ids": [bundle_id], "limit": 100}, где
+    bundle_id — UUID-строка из supplies[i]["bundle_id"] (не supply_id и не order_id). limit обязателен,
+    подтверждено реальной ошибкой ("Limit: value must be inside range (0, 100]") — 100 (максимум) на один
+    bundle_id с запасом, без пагинации. Поле с фактическим количеством в ответе ещё не подтверждено —
+    сверим по факту первого успешного запроса.
     ⚠️ ВРЕМЕННО: см. _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST/_RESPONSE и _run_ozon_supply_sync_and_reply,
     убрать вместе после того, как подтвердим и формат запроса, и форму ответа."""
     global _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST, _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
-    body = {"bundle_ids": [bundle_id]}
+    body = {"bundle_ids": [bundle_id], "limit": 100}
     _DEBUG_LAST_SUPPLY_BUNDLE_REQUEST = body  # ВРЕМЕННО
     try:
         data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", body)
