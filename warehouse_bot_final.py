@@ -3092,99 +3092,73 @@ SKU_TO_PRODUCT_NAME = {
 }
 
 
-# ВРЕМЕННО (отладка /v3/supply-order/list и /get) — сырые ответы для показа в Telegram, убрать вместе с блоком ниже
-_DEBUG_LAST_SUPPLY_LIST_RESPONSE = None
-_DEBUG_LAST_SUPPLY_GET_RESPONSE = None
-_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = None
-
-
 async def fetch_ozon_supply_order_ids(client_id: str, api_key: str, date_from: str, date_to: str) -> list:
-    """ID поставок за период. Реальный ответ подтвердил структуру: {"order_ids": [int, int, ...]} прямо в
-    корне — БЕЗ обёртки "result" и без обёртки-объекта на каждую поставку (никаких supply_orders/orders/items,
-    как предполагалось раньше). /v3/supply-order/list отдаёт только ID; детали (номер, статус, состав) —
-    отдельным вызовом /v3/supply-order/get, см. fetch_ozon_supply_order_details.
+    """ID поставок за период. Подтверждено реальным ответом: {"order_ids": [int, int, ...]} прямо в корне —
+    без обёртки "result" и без объектов на каждую поставку. /v3/supply-order/list отдаёт только ID; детали
+    (статус, состав supplies) — отдельным вызовом /v3/supply-order/get, см. fetch_ozon_supply_order_details.
 
     sort_by=1 и filter.states=[1..11] подтверждены реальными ответами Ozon (прошли валидацию).
     Пагинация (last_id/has_next) в подтверждённом ответе не видна — возможно, её просто нет для этого
-    метода (весь список приходит одним ответом), возможно поля называются иначе. ⚠️ best-effort, сверим
-    по факту следующего реального запроса, если понадобится пагинация."""
-    global _DEBUG_LAST_SUPPLY_LIST_RESPONSE
+    метода (весь список приходит одним ответом). ⚠️ сверим по факту, если понадобится пагинация."""
     data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/list", {
         "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z", "states": OZON_SUPPLY_STATES_PROBE},
         "sort_by": 1, "last_id": "", "limit": 100,
     })
-    _DEBUG_LAST_SUPPLY_LIST_RESPONSE = data  # ВРЕМЕННО
     return data.get("order_ids") or (data.get("result") or {}).get("order_ids") or []
 
 
 SUPPLY_ORDER_GET_CHUNK_SIZE = 50  # подтверждено реальной ошибкой: OrderIds принимает от 1 до 50 элементов включительно
+SUPPLY_ORDER_COMPLETED_STATE = "COMPLETED"  # подтверждено реальным ответом /v3/supply-order/get
 
 
 async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_ids: list) -> list:
-    """Детали поставок по ID через /v3/supply-order/get (та же схема ключа "order_ids", что подтвердилась
-    у /list). Бьём на чанки по SUPPLY_ORDER_GET_CHUNK_SIZE — 76 ID одним запросом дали 400
-    "OrderIds: value must contain between 1 and 50 items, inclusive". Форма самого ответа (какие поля
-    внутри каждой поставки) пока НЕ проверена — best-effort, сверим по факту первого успешного запроса."""
-    global _DEBUG_LAST_SUPPLY_GET_RESPONSE
+    """Детали поставок по ID через /v3/supply-order/get (та же схема ключа "order_ids", что у /list).
+    Бьём на чанки по SUPPLY_ORDER_GET_CHUNK_SIZE — подтверждено реальной ошибкой ("OrderIds: value must
+    contain between 1 and 50 items, inclusive"). Каждый order содержит массив "supplies", у каждой supply
+    свой supply_id/state — см. collect_supply_acceptance_lines."""
     if not order_ids:
         return []
     all_orders = []
-    debug_chunks = []
     for i in range(0, len(order_ids), SUPPLY_ORDER_GET_CHUNK_SIZE):
         chunk = order_ids[i:i + SUPPLY_ORDER_GET_CHUNK_SIZE]
-        try:
-            data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": chunk})
-        except httpx.HTTPStatusError as e:
-            # ВРЕМЕННО: тело ошибки тоже кладём в debug-переменную — иначе при 400/... сюда так и не доходит
-            # успешный data, и /get-дамп в Telegram не отправляется вообще.
-            debug_chunks.append({"http_status": e.response.status_code, "body": e.response.text})
-            _DEBUG_LAST_SUPPLY_GET_RESPONSE = debug_chunks  # ВРЕМЕННО
-            raise
-        debug_chunks.append(data)
+        data = await _ozon_api_post(client_id, api_key, "/v3/supply-order/get", {"order_ids": chunk})
         result = data.get("result") or data
         all_orders.extend(result.get("orders") or result.get("supply_orders") or result.get("items") or [])
-    _DEBUG_LAST_SUPPLY_GET_RESPONSE = debug_chunks  # ВРЕМЕННО
     return all_orders
 
 
-async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, bundle_id) -> list:
-    """Состав поставки по SKU через /v1/supply-order/bundle. Реальный ответ /v3/supply-order/get показал, что
-    один order содержит МАССИВ supplies, и у каждой supply есть свой bundle_id (UUID) — совпадение имени
-    поля с именем эндпоинта /bundle слишком показательное, чтобы не проверить в первую очередь (раньше сюда
-    ошибочно передавался order_id верхнего уровня, отсюда и 400). Поле с фактическим количеством в ответе
-    ещё не подтверждено — сверим по факту первого успешного запроса."""
-    global _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE
-    try:
-        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_id": bundle_id})
-    except httpx.HTTPStatusError as e:
-        _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = {"http_status": e.response.status_code, "body": e.response.text}  # ВРЕМЕННО
-        raise
-    _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE = data  # ВРЕМЕННО
+async def fetch_ozon_supply_order_bundle(client_id: str, api_key: str, supply_id) -> list:
+    """Состав поставки по SKU через /v1/supply-order/bundle, по supply_id конкретной supply (не order_id —
+    у одного order может быть несколько supplies, у каждой свой независимый состав). Поле с фактическим
+    количеством в ответе ещё не подтверждено — сверим по факту первого успешного запроса."""
+    data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"supply_id": supply_id})
     result = data.get("result") or data
     return result.get("items") or result.get("bundle") or []
 
 
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
     """Возвращает (lines, status_counts). Единица приёмки — ОТДЕЛЬНАЯ supply внутри order (не сам order):
-    у order может быть несколько supplies, у каждой свой supply_id/bundle_id/state. supply_number для дедупа
-    и списания — supply_id (не order_id и не order_number, которые общие на весь order).
-    Фильтр по статусу сознательно НЕ делаем — реальное значение "state" (например "COMPLETED") уже видели
-    в ответе /get, но собираем сырую статистику и показываем админу, чтобы решить вместе, что считать
-    'завершено', вместо того чтобы гадать заранее."""
+    у order может быть несколько supplies, у каждой свой supply_id/state. supply_number для дедупа и
+    списания — supply_id (не order_id/order_number, общие на весь order).
+    Обрабатываем только supplies с state == SUPPLY_ORDER_COMPLETED_STATE ("COMPLETED", подтверждено реальным
+    ответом) — и на уровне order, и на уровне supply. status_counts всё равно считаем по всем supplies
+    (включая незавершённые), чтобы в отчёте админу было видно полную картину, а не только обработанное."""
     order_ids = await fetch_ozon_supply_order_ids(client_id, api_key, date_from, date_to)
     orders = await fetch_ozon_supply_order_details(client_id, api_key, order_ids)
     lines = []
     status_counts = {}
     for order in orders:
+        order_state = order.get("state") or "неизвестно"
         for supply in order.get("supplies") or []:
+            supply_state = supply.get("state") or "неизвестно"
+            status_counts[supply_state] = status_counts.get(supply_state, 0) + 1
+            if order_state != SUPPLY_ORDER_COMPLETED_STATE or supply_state != SUPPLY_ORDER_COMPLETED_STATE:
+                continue
             supply_id = supply.get("supply_id")
-            bundle_id = supply.get("bundle_id")
-            raw_status = supply.get("state") or order.get("state") or "неизвестно"
-            status_counts[raw_status] = status_counts.get(raw_status, 0) + 1
-            if not bundle_id:
+            if not supply_id:
                 continue
 
-            items = await fetch_ozon_supply_order_bundle(client_id, api_key, bundle_id)
+            items = await fetch_ozon_supply_order_bundle(client_id, api_key, supply_id)
             for item in items:
                 sku = item.get("sku")
                 accepted_qty = item.get("quantity") or item.get("fact_quantity") or item.get("accepted_quantity")
@@ -3192,7 +3166,7 @@ async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_fro
                     continue
                 lines.append({
                     "supply_number": str(supply_id), "sku": sku, "accepted_qty": accepted_qty,
-                    "raw_json": {"order_id": order.get("order_id"), "supply": supply, "item": item, "state": raw_status},
+                    "raw_json": {"order_id": order.get("order_id"), "supply": supply, "item": item, "state": supply_state},
                 })
     return lines, status_counts
 
@@ -3263,20 +3237,6 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
-async def _send_supply_debug_dumps(update: Update):
-    """ВРЕМЕННО: сырые ответы /v3/supply-order/list и /get отдельными сообщениями (бюджет побольше, чем в
-    основном статусе) — без похода в логи Bothost. Убрать вместе с _DEBUG_LAST_SUPPLY_*_RESPONSE."""
-    if _DEBUG_LAST_SUPPLY_LIST_RESPONSE is not None:
-        raw = json.dumps(_DEBUG_LAST_SUPPLY_LIST_RESPONSE, ensure_ascii=False)[:3500]
-        await update.message.reply_text(f"🐞 DEBUG /v3/supply-order/list сырой ответ (первые 3500 симв.):\n{raw}")
-    if _DEBUG_LAST_SUPPLY_GET_RESPONSE is not None:
-        raw = json.dumps(_DEBUG_LAST_SUPPLY_GET_RESPONSE, ensure_ascii=False)[:3500]
-        await update.message.reply_text(f"🐞 DEBUG /v3/supply-order/get сырой ответ (первые 3500 симв.):\n{raw}")
-    if _DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE is not None:
-        raw = json.dumps(_DEBUG_LAST_SUPPLY_BUNDLE_RESPONSE, ensure_ascii=False)[:3500]
-        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle сырой ответ (первые 3500 симв.):\n{raw}")
-
-
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3292,14 +3252,12 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"списано {stats['processed']}, уже было {stats['skipped_dup']}, "
             f"неизвестный SKU {stats['skipped_unknown_sku']}, нулевое кол-во {stats['skipped_zero_qty']}, "
             f"ошибок {stats['errors']}.\n\n"
-            f"📋 Статусы поставок (сырые, для проверки фильтра): {status_line}",
+            f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
-        await _send_supply_debug_dumps(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
-        await _send_supply_debug_dumps(update)  # ВРЕМЕННО — вдруг запрос всё же успел дойти до ответа
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
