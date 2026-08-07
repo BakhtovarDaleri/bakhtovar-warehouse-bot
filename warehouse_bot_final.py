@@ -3131,36 +3131,22 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
     return all_orders
 
 
-SUPPLY_BUNDLE_CHUNK_SIZE = 30  # батч bundle_ids за один запрос (метод принимает массив, до 1000) — меньше вызовов
-SUPPLY_BUNDLE_PAUSE_SECONDS = 0.4  # пауза между батч-запросами — подстраховка сверх retry на 429 в _ozon_api_post
+SUPPLY_BUNDLE_PAUSE_SECONDS = 0.4  # пауза между вызовами — подстраховка сверх retry на 429 в _ozon_api_post
 
 
 async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: list) -> dict:
-    """Состав поставок по SKU через /v1/supply-order/bundle, батчами по SUPPLY_BUNDLE_CHUNK_SIZE bundle_ids
-    за запрос — {"bundle_ids": [...], "limit": 100}, оба поля подтверждены реальными ошибками валидации.
-    Возвращает {bundle_id: [items]}.
-    ⚠️ Группировка результата по bundle_id при батче из НЕСКОЛЬКИХ id не подтверждена реальным ответом —
-    тестировали только запрос с одним bundle_id. Если Ozon не группирует явно (ищем ключи bundles/results),
-    а батч больше 1 — намеренно падаем с понятной ошибкой вместо угадывания: неверное сопоставление
-    товар→поставка на списании склада может задвоить или перепутать данные, это хуже, чем упасть и
-    посмотреть на реальные ключи ответа в тексте ошибки."""
+    """Состав поставок по SKU через /v1/supply-order/bundle — по ОДНОМУ bundle_id за запрос.
+    Батчинг несколькими bundle_id пробовали, но откатили: мы ни разу не видели реальный успешный (200)
+    ответ этого метода — все попытки падали с 400/429 ещё до успешного запроса, поэтому нет данных о том,
+    содержит ли каждый item собственную ссылку на bundle_id/supply_id для безопасной группировки при
+    батче. Пока не увидим реальные items — один bundle_id на запрос, с паузой и retry с задержкой на 429
+    (см. _ozon_api_post), чтобы не перепутать товары между разными поставками при списании склада."""
     result_by_bundle = {}
-    for i in range(0, len(bundle_ids), SUPPLY_BUNDLE_CHUNK_SIZE):
-        chunk = bundle_ids[i:i + SUPPLY_BUNDLE_CHUNK_SIZE]
-        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_ids": chunk, "limit": 100})
+    for i, bundle_id in enumerate(bundle_ids):
+        data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_ids": [bundle_id], "limit": 100})
         result = data.get("result") or data
-        bundles = result.get("bundles") or result.get("results")
-        if bundles:
-            for b in bundles:
-                result_by_bundle[b.get("bundle_id")] = b.get("items") or []
-        elif len(chunk) == 1:
-            result_by_bundle[chunk[0]] = result.get("items") or result.get("bundle") or []
-        else:
-            raise RuntimeError(
-                f"/v1/supply-order/bundle не вернул явную группировку по bundle_id для батча из {len(chunk)} — "
-                f"нельзя безопасно сопоставить товары с конкретными поставками. Ключи ответа: {list(result.keys())}"
-            )
-        if i + SUPPLY_BUNDLE_CHUNK_SIZE < len(bundle_ids):
+        result_by_bundle[bundle_id] = result.get("items") or result.get("bundle") or []
+        if i < len(bundle_ids) - 1:
             await asyncio.sleep(SUPPLY_BUNDLE_PAUSE_SECONDS)
     return result_by_bundle
 
