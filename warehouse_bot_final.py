@@ -3133,6 +3133,15 @@ async def fetch_ozon_supply_order_details(client_id: str, api_key: str, order_id
 
 SUPPLY_BUNDLE_PAUSE_SECONDS = 0.4  # пауза между вызовами — подстраховка сверх retry на 429 в _ozon_api_post
 
+# ВРЕМЕННО: сэмпл реальных items из /v1/supply-order/bundle — ищем поле shipment_type (короб/монопалет) и
+# соседние поля (в т.ч. кластер), чтобы не гадать при написании логики условного списания коробок и
+# хранения кластера на уровне строки. Берём не больше _DEBUG_ITEMS_PER_BUNDLE с одной поставки, чтобы
+# сэмпл покрывал РАЗНЫЕ bundle_id, а не исчерпался на items одной первой поставки. Убрать вместе с блоком
+# в _run_ozon_supply_sync_and_reply, как только увидим реальную структуру.
+_DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE = []
+_DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE_LIMIT = 20
+_DEBUG_ITEMS_PER_BUNDLE = 2
+
 
 async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: list) -> dict:
     """Состав поставок по SKU через /v1/supply-order/bundle — по ОДНОМУ bundle_id за запрос.
@@ -3141,11 +3150,17 @@ async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: li
     содержит ли каждый item собственную ссылку на bundle_id/supply_id для безопасной группировки при
     батче. Пока не увидим реальные items — один bundle_id на запрос, с паузой и retry с задержкой на 429
     (см. _ozon_api_post), чтобы не перепутать товары между разными поставками при списании склада."""
+    global _DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE
     result_by_bundle = {}
     for i, bundle_id in enumerate(bundle_ids):
         data = await _ozon_api_post(client_id, api_key, "/v1/supply-order/bundle", {"bundle_ids": [bundle_id], "limit": 100})
         result = data.get("result") or data
-        result_by_bundle[bundle_id] = result.get("items") or result.get("bundle") or []
+        items = result.get("items") or result.get("bundle") or []
+        result_by_bundle[bundle_id] = items
+        # ВРЕМЕННО
+        if len(_DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE) < _DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE_LIMIT:
+            for item in items[:_DEBUG_ITEMS_PER_BUNDLE]:
+                _DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE.append({"bundle_id": bundle_id, **item})
         if i < len(bundle_ids) - 1:
             await asyncio.sleep(SUPPLY_BUNDLE_PAUSE_SECONDS)
     return result_by_bundle
@@ -3258,6 +3273,17 @@ async def _run_ozon_supply_acceptance_sync(db: "SupabaseService", date_from: str
     }
 
 
+async def _send_supply_bundle_items_debug_dump(update: Update):
+    """ВРЕМЕННО: сэмпл реальных items из /v1/supply-order/bundle — ищем shipment_type (короб/монопалет) и
+    соседние поля (в т.ч. кластер). Убрать вместе с _DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE."""
+    if not _DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE:
+        return
+    raw = json.dumps(_DEBUG_SUPPLY_BUNDLE_ITEMS_SAMPLE, ensure_ascii=False)
+    chunk_size = 3500
+    for i in range(0, min(len(raw), chunk_size * 3), chunk_size):
+        await update.message.reply_text(f"🐞 DEBUG /v1/supply-order/bundle — сэмпл items ({i // chunk_size + 1}):\n{raw[i:i + chunk_size]}")
+
+
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3276,9 +3302,11 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
             f"📋 Статусы supplies за период (все, включая незавершённые): {status_line}",
             reply_markup=get_main_menu_keyboard(update.effective_user.id),
         )
+        await _send_supply_bundle_items_debug_dump(update)  # ВРЕМЕННО
     except Exception as e:
         logger.exception("Синхронизация приёмки поставок Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await _send_supply_bundle_items_debug_dump(update)  # ВРЕМЕННО
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
 
