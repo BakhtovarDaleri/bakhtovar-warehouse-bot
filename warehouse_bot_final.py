@@ -3274,10 +3274,17 @@ async def _send_supply_order_sample_debug_dump(update: Update):
     полей даты отгрузки/приёмки и кластера. Убрать вместе с _DEBUG_ORDER_SAMPLE, как только поля
     найдены и перенесены в миграцию/код синка."""
     if _DEBUG_ORDER_SAMPLE is None:
+        await update.message.reply_text("🐞 DEBUG: ни одного COMPLETED order с supply не найдено в этом прогоне — сэмпл не захвачен.")
         return
     text = "🐞 DEBUG — пример order целиком (одна supply):\n" + json.dumps(_DEBUG_ORDER_SAMPLE, ensure_ascii=False, indent=2, default=str)
     for i in range(0, len(text), 3900):
         await update.message.reply_text(text[i:i + 3900])
+
+
+# ВРЕМЕННО: метка сборки, чтобы по тексту обычного отчёта в Telegram видеть, какая версия кода
+# реально запущена на хостинге, не дожидаясь появления/непоявления DEBUG-сообщений. Убрать вместе
+# с остальным временным DEBUG-выводом приёмки поставок.
+SUPPLY_SYNC_BUILD_TAG = "order-sample-debug-v1"
 
 
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
@@ -3285,7 +3292,11 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return
     context.bot_data["ozon_supply_sync_running"] = True
-    await update.message.reply_text(f"🔄 Проверяю приёмки поставок Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text(
+        f"🔄 Проверяю приёмки поставок Ozon за {date_from} — {date_to}, подождите... "
+        f"[build: {SUPPLY_SYNC_BUILD_TAG}]",
+        reply_markup=get_main_menu_keyboard(update.effective_user.id),
+    )
     db = context.bot_data.get("db")
     try:
         stats = await _run_ozon_supply_acceptance_sync(db, date_from, date_to)
