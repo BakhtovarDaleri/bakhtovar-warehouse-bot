@@ -496,12 +496,6 @@ class SupabaseService:
         )
         return res.data or []
 
-    def get_distinct_supply_clusters(self) -> list:
-        """ВРЕМЕННО (задача 4): все уникальные cluster, уже сохранённые из macrolocal_cluster_id —
-        сверяем их с результатом /v1/cluster/list, чтобы понять, тот же это ID-неймспейс или нет."""
-        res = self.client.table("ozon_supply_acceptances").select("cluster").not_.is_("cluster", "null").execute()
-        return sorted({r["cluster"] for r in (res.data or [])})
-
     def get_crossdocking_amounts_by_posting(self, posting_numbers: list) -> dict:
         """Сумма amount по operation_type='MarketplaceServiceItemCrossdocking', сгруппированная по
         posting_number (= supply_number). Крестдокинг не разбивается по SKU — сумма относится к поставке
@@ -3238,15 +3232,22 @@ async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: li
 
 
 async def fetch_ozon_clusters(client_id: str, api_key: str) -> list:
-    """ВРЕМЕННО (задача 4, названия кластеров): /v1/cluster/list — метод и схема ({"clusters": [{"id",
-    "name", "type", "logistic_clusters":[...]}]}) подтверждены по исходникам стороннего Go-клиента
-    Ozon API (github.com/diPhantxm/ozon-api-client, ozon/clusters.go), а не живым вызовом — сам факт,
-    что id из этого справочника совпадает по значению с macrolocal_cluster_id, который мы уже храним
-    (например "4066"), ещё НЕ подтверждён. Запрашиваем без cluster_ids (весь справочник), чтобы свести
-    его с уже известными нам ID и проверить, получаются ли осмысленные русские названия регионов."""
+    """/v1/cluster/list — подтверждено живыми данными: каждый элемент clusters[] несёт свой
+    macrolocal_cluster_id (то же значение, что мы храним в ozon_supply_acceptances.cluster) прямо
+    рядом с id/name/type, без сопоставления по позиции или поиску во вложенных полях."""
     data = await _ozon_api_post(client_id, api_key, "/v1/cluster/list", {"cluster_type": "CLUSTER_TYPE_OZON"})
     result = data.get("result") or data
     return result.get("clusters") or []
+
+
+async def fetch_ozon_cluster_names(client_id: str, api_key: str) -> dict:
+    """{macrolocal_cluster_id (str) -> человекочитаемое название}, для резолва в отчёте по поставкам.
+    Тянется один раз за прогон отчёта (см. _run_ozon_supply_report_and_reply), не на каждую строку."""
+    clusters = await fetch_ozon_clusters(client_id, api_key)
+    return {
+        str(c["macrolocal_cluster_id"]): c.get("name")
+        for c in clusters if c.get("macrolocal_cluster_id") is not None
+    }
 
 
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
@@ -3415,54 +3416,6 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
     return updated
 
 
-def _find_matching_nested_ids(obj, known_ids: set, path: str = "clusters") -> list:
-    """Рекурсивно обходит весь ответ /v1/cluster/list (включая logistic_clusters/warehouses) и ищет
-    любое поле, оканчивающееся на "id", значение которого совпадает с одним из наших known macrolocal
-    cluster ID — не гадаем заранее, в каком именно вложенном поле может быть совпадение."""
-    matches = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k.lower().endswith("id") and str(v) in known_ids:
-                matches.append(f"{path}.{k} = {v!r}")
-            matches.extend(_find_matching_nested_ids(v, known_ids, f"{path}.{k}"))
-    elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            matches.extend(_find_matching_nested_ids(item, known_ids, f"{path}[{i}]"))
-    return matches
-
-
-async def _send_cluster_names_debug_dump(update: Update, db: "SupabaseService"):
-    """ВРЕМЕННО (задача 4, названия кластеров): диапазоны id верхнего уровня совсем разные (2-193 у
-    /v1/cluster/list vs 4002-4077 у наших macrolocal_cluster_id) — 0 из 22 не совпало, и это не
-    совпадение количества (22=22), рискованно сопоставлять по позиции. Следующая гипотеза: наш ID может
-    совпадать с чем-то ВНУТРИ вложенного logistic_clusters/warehouses, которое мы раньше не смотрели.
-    Показываем полную структуру ОДНОГО элемента clusters[] целиком (с logistic_clusters) для ручного
-    осмотра, плюс автоматический рекурсивный поиск known ID по ВСЕМ вложенным полям — если и там ничего
-    не найдётся, это будет означать, что macrolocal_cluster_id и cluster.id — разные, несвязанные
-    понятия, и не стоит выдумывать связь. Самодостаточная, ловит свои ошибки. Убрать вместе с
-    fetch_ozon_clusters/get_distinct_supply_clusters/_find_matching_nested_ids по завершении задачи 4."""
-    try:
-        known_clusters = db.get_distinct_supply_clusters()
-        clusters = await fetch_ozon_clusters(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
-
-        matches = _find_matching_nested_ids(clusters, set(known_clusters))
-        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров."]
-        if matches:
-            lines.append(f"Совпадения known ID во вложенных полях ({len(matches)}):")
-            lines.extend(f"  {m}" for m in matches)
-        else:
-            lines.append("Совпадений known ID нигде во вложенной структуре НЕ найдено.")
-        lines.append(f"\nНаши известные cluster ID (из БД): {', '.join(known_clusters)}")
-        lines.append("\nПолная структура одного элемента clusters[0]:")
-        lines.append(json.dumps(clusters[0] if clusters else {}, ensure_ascii=False, indent=2, default=str))
-
-        text = "\n".join(lines)
-        for i in range(0, len(text), 3900):
-            await update.message.reply_text(text[i:i + 3900])
-    except Exception as e:
-        logger.exception("DEBUG (задача 4): не удалось получить /v1/cluster/list")
-        await update.message.reply_text(f"🐞 DEBUG (задача 4): не удалось получить /v1/cluster/list: {e}")
-
 
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
@@ -3490,7 +3443,6 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
-    await _send_cluster_names_debug_dump(update, db)  # ВРЕМЕННО (задача 4)
 
 
 async def ozon_supply_sync_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3582,14 +3534,22 @@ def _split_amount_by_qty(total_amount: float, quantities: list) -> list:
     return shares
 
 
-def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
+def _cluster_label(cluster_id: str, cluster_names: dict) -> str:
+    """Название кластера, если нашлось в справочнике /v1/cluster/list, иначе — сырой ID (не молчим,
+    чтобы было видно, что справочник не покрывает этот конкретный ID, а не что кластера нет вовсе)."""
+    name = cluster_names.get(cluster_id)
+    return f"{name} ({cluster_id})" if name else cluster_id
+
+
+def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_names: dict) -> str:
     """Строит текст отчёта по поставкам, сгруппированный по заявке (order_number): заявка сверху с общей
     датой отгрузки, внутри — её поставки с кластером/датой приёмки/товарами. Ozon отдаёт сумму кросс-докинга
     на поставку целиком, не по SKU — для поставки с одним товаром вся сумма относится к нему, для поставки
     с несколькими товарами делим пропорционально принятому количеству (_split_amount_by_qty). Агрегат по
     кластеру считает сумму кросс-докинга один раз на supply_number (не на каждую строку), чтобы не задвоить
     её при нескольких SKU в одной поставке — разбивка по товару ниже влияет только на отображение, не на
-    этот итог. Суммы кросс-докинга округляются до целых рублей."""
+    этот итог. Суммы кросс-докинга округляются до целых рублей. Группировка/агрегация всё ещё идёт по
+    сырому cluster ID — cluster_names только подменяет то, что видит пользователь в тексте."""
     if not rows:
         return "За выбранный период приёмок с проставленной датой приёмки не найдено."
 
@@ -3613,7 +3573,7 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
             items = supply_entry["items"]
             cross_amount = crossdock_by_supply.get(supply_number)
             item_shares = _split_amount_by_qty(cross_amount, [q for _, q in items]) if cross_amount is not None else [None] * len(items)
-            lines.append(f"  Поставка №{supply_number} | кластер {cluster} | приёмка {_format_date_ru(supply_entry['completed_at'])}")
+            lines.append(f"  Поставка №{supply_number} | кластер {_cluster_label(cluster, cluster_names)} | приёмка {_format_date_ru(supply_entry['completed_at'])}")
             for (product_name, qty), share in zip(items, item_shares):
                 share_str = f"{share}₽" if share is not None else "нет данных"
                 lines.append(f"    {product_name} — {qty:.0f} шт | кросс-докинг: {share_str}")
@@ -3626,7 +3586,7 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
         total_cross = sum(crossdock_by_supply.get(s, 0) for s in supply_set)
         total_qty = qty_by_cluster[cluster]
         per_unit = (total_cross / total_qty) if total_qty else 0
-        lines.append(f"  {cluster}: {_round_rub(total_cross)}₽ / {total_qty:.0f} шт = {per_unit:.2f}₽/шт")
+        lines.append(f"  {_cluster_label(cluster, cluster_names)}: {_round_rub(total_cross)}₽ / {total_qty:.0f} шт = {per_unit:.2f}₽/шт")
 
     return "\n".join(lines)
 
@@ -3636,14 +3596,21 @@ async def _run_ozon_supply_report_and_reply(update: Update, context: ContextType
     rows = db.get_supply_acceptance_report_rows(date_from, date_to)
     supply_numbers = list({r["supply_number"] for r in rows})
     crossdock_by_supply = db.get_crossdocking_amounts_by_posting(supply_numbers)
-    text = build_supply_report_text(rows, crossdock_by_supply)
+    try:
+        # Справочник тянется один раз на весь отчёт, не на каждую строку.
+        cluster_names = await fetch_ozon_cluster_names(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
+    except Exception:
+        logger.exception("Не удалось получить /v1/cluster/list для отчёта по поставкам")
+        cluster_names = {}
+    text = build_supply_report_text(rows, crossdock_by_supply, cluster_names)
     for i in range(0, len(text), 3900):
         await update.message.reply_text(text[i:i + 3900], reply_markup=get_main_menu_keyboard(update.effective_user.id))
 
 
 async def ozon_supply_report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Шаг 1: выбор периода отчёта по поставкам (только админ). Читает уже сохранённые данные
-    из Supabase — к Ozon API не обращается."""
+    """Шаг 1: выбор периода отчёта по поставкам (только админ). Данные по поставкам/кросс-докингу —
+    из Supabase; к Ozon API обращается только за справочником названий кластеров (/v1/cluster/list,
+    один раз на прогон отчёта)."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
