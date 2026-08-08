@@ -1391,7 +1391,7 @@ async def history_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sign = "➕" if float(r["amount"]) >= 0 else "➖"
         item = r.get("item_name") or ""
         reversed_tag = " ↩️сторно" if r.get("reversed_by") else ""
-        lines.append(f"{i}. {sign} {r.get('operation_date','')} | {r.get('operation_type','')} {item} | {r['amount']} ₽ | итог: {round(running,2)} ₽{reversed_tag}")
+        lines.append(f"{i}. {sign} {_format_date_ru(r.get('operation_date'))} | {r.get('operation_type','')} {item} | {r['amount']} ₽ | итог: {round(running,2)} ₽{reversed_tag}")
 
     text = "\n".join([lines[0]] + lines[-20:]) if len(lines) > 21 else "\n".join(lines)
     text += f"\n\n💰 *Текущий остаток долга: {round(running,2)} ₽*"
@@ -1433,7 +1433,7 @@ async def history_reverse_number(update: Update, context: ContextTypes.DEFAULT_T
     item = row.get("item_name") or ""
     summary = (
         f"↩️ *Подтвердите отмену операции:*\n"
-        f"{row.get('operation_date','')} | {row.get('operation_type','')} {item} | {row['amount']} ₽\n\n"
+        f"{_format_date_ru(row.get('operation_date'))} | {row.get('operation_type','')} {item} | {row['amount']} ₽\n\n"
         f"Будет создана компенсирующая запись на {-float(row['amount'])} ₽."
     )
     await update.message.reply_text(summary, reply_markup=ReplyKeyboardMarkup([["✅ Подтвердить отмену"], ["❌ Главное меню"]], resize_keyboard=True), parse_mode="Markdown")
@@ -1537,7 +1537,7 @@ async def warehouse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         lines = ["📋 *История работ по складу*\n"]
         for r in rows[-25:]:
-            lines.append(f"▫️ {r['date']} | {r['label']} | {r['detail']}")
+            lines.append(f"▫️ {_format_date_ru(r['date'])} | {r['label']} | {r['detail']}")
         await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu_keyboard(update.effective_user.id), parse_mode="Markdown")
         return ConversationHandler.END
 
@@ -1666,7 +1666,7 @@ async def logistics_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in rows[-20:]:
             qty = r.get("quantity")
             per_kg = f" ({round(float(r['amount'])/float(qty),2)}₽/шт)" if qty else ""
-            lines.append(f"▫️ {r.get('operation_date','')} | {r.get('comment','')} | {r['amount']}\u20bd{per_kg}")
+            lines.append(f"▫️ {_format_date_ru(r.get('operation_date'))} | {r.get('comment','')} | {r['amount']}\u20bd{per_kg}")
         avg = round(total_amount / total_qty, 2) if total_qty else None
         lines.append(f"\n💰 Всего потрачено: {round(total_amount,2)} ₽")
         if avg:
@@ -2421,7 +2421,7 @@ async def sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def format_full_profit_text(p: dict, date_from: str, date_to: str) -> str:
-    lines = [f"💵 *Прибыль за период {date_from} — {date_to}*\n"]
+    lines = [f"💵 *Прибыль за период {_format_date_ru(date_from)} — {_format_date_ru(date_to)}*\n"]
     lines.append(f"💰 Выручка (реально от площадок, после всех их вычетов): *{p['revenue']} ₽*\n")
 
     lines.append("📦 *По товарам:*")
@@ -2571,7 +2571,7 @@ async def run_ozon_sync_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         count = await sync_ozon_transactions(db, "Булат", OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
         logger.info(f"Ozon sync: обновлено {count} транзакций за {date_from}–{date_to}")
-        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🔄 Ozon: синхронизировано {count} транзакций за {date_from} — {date_to}")
+        await context.bot.send_message(chat_id=ADMIN_ID, text=f"🔄 Ozon: синхронизировано {count} транзакций за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}")
     except Exception as e:
         logger.error(f"Ozon sync failed: {e}")
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ Ошибка синхронизации Ozon: {e}")
@@ -2628,11 +2628,11 @@ async def _run_ozon_sync_and_reply(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("⏳ Синхронизация уже идёт, подождите её завершения — не нажимайте повторно.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return
     context.bot_data["ozon_sync_running"] = True
-    await update.message.reply_text(f"🔄 Синхронизирую данные с Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text(f"🔄 Синхронизирую данные с Ozon за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     db = context.bot_data.get("db")
     try:
         count = await sync_ozon_transactions(db, "Булат", OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, date_from, date_to)
-        await update.message.reply_text(f"✅ Готово: синхронизировано {count} транзакций за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await update.message.reply_text(f"✅ Готово: синхронизировано {count} транзакций за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     except Exception as e:
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     finally:
@@ -3032,17 +3032,17 @@ async def _run_ozon_feedback_sync_and_reply(update: Update, context: ContextType
         await update.message.reply_text("⏳ Синхронизация отзывов уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return
     context.bot_data["ozon_feedback_sync_running"] = True
-    await update.message.reply_text(f"🔄 Проверяю отзывы и вопросы Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text(f"🔄 Проверяю отзывы и вопросы Ozon за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     db = context.bot_data.get("db")
     try:
         success_count, error_count = await _run_ozon_feedback_sync(db, context, date_from, date_to)
         if error_count:
             await update.message.reply_text(
-                f"⚠️ За {date_from} — {date_to}: обработано {success_count}, ошибок {error_count}. Подробности — в логах бота.",
+                f"⚠️ За {_format_date_ru(date_from)} — {_format_date_ru(date_to)}: обработано {success_count}, ошибок {error_count}. Подробности — в логах бота.",
                 reply_markup=get_main_menu_keyboard(update.effective_user.id),
             )
         else:
-            await update.message.reply_text(f"✅ Готово: обработано {success_count} новых отзывов/вопросов за {date_from} — {date_to}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+            await update.message.reply_text(f"✅ Готово: обработано {success_count} новых отзывов/вопросов за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     except Exception as e:
         logger.exception("Ручная синхронизация отзывов/вопросов Ozon failed")
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3441,7 +3441,7 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
         return
     context.bot_data["ozon_supply_sync_running"] = True
-    await update.message.reply_text(f"🔄 Проверяю приёмки поставок Ozon за {date_from} — {date_to}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    await update.message.reply_text(f"🔄 Проверяю приёмки поставок Ozon за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}, подождите...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     db = context.bot_data.get("db")
     try:
         backfilled = await backfill_supply_acceptance_extra_fields(db, OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
@@ -3449,7 +3449,7 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
         status_line = ", ".join(f"{k}: {v}" for k, v in stats["status_counts"].items()) or "—"
         backfill_line = f"\n🔧 Досохранены поля старых поставок: {backfilled}." if backfilled else ""
         await update.message.reply_text(
-            f"✅ Приёмки за {date_from} — {date_to} (из {stats['total']} строк):\n"
+            f"✅ Приёмки за {_format_date_ru(date_from)} — {_format_date_ru(date_to)} (из {stats['total']} строк):\n"
             f"списано {stats['processed']}, уже было {stats['skipped_dup']}, "
             f"неизвестный SKU {stats['skipped_unknown_sku']}, нулевое кол-во {stats['skipped_zero_qty']}, "
             f"ошибок {stats['errors']}.\n\n"
@@ -3521,9 +3521,10 @@ async def ozon_supply_sync_period_custom(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
-def _format_supply_date(raw) -> str:
-    """ГГГГ-ММ-ДД (или ISO-таймстамп) -> ДД.ММ.ГГГГ. Берём только первые 10 символов — время в отчёте
-    не нужно, формат разделителя (T/пробел) не важен, так как дата всегда в начале строки."""
+def _format_date_ru(raw) -> str:
+    """ГГГГ-ММ-ДД (или ISO-таймстамп) -> ДД.ММ.ГГГГ. Единый формат отображения дат по всему боту.
+    Берём только первые 10 символов — время не нужно, формат разделителя (T/пробел) не важен, так как
+    дата всегда в начале строки."""
     if not raw:
         return "—"
     parts = str(raw)[:10].split("-")
@@ -3561,13 +3562,13 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
     qty_by_cluster = {}
     supplies_by_cluster = {}
     for order_number, order_entry in orders.items():
-        lines.append(f"📋 Заявка {order_number} | отгрузка {_format_supply_date(order_entry['shipment_date'])}")
+        lines.append(f"📋 Заявка {order_number} | отгрузка {_format_date_ru(order_entry['shipment_date'])}")
         for supply_number, supply_entry in order_entry["supplies"].items():
             cluster = supply_entry["cluster"]
             cross_amount = crossdock_by_supply.get(supply_number)
             cross_str = f"{_round_rub(cross_amount)}₽" if cross_amount is not None else "нет данных"
             lines.append(
-                f"  Поставка №{supply_number} | кластер {cluster} | приёмка {_format_supply_date(supply_entry['completed_at'])} "
+                f"  Поставка №{supply_number} | кластер {cluster} | приёмка {_format_date_ru(supply_entry['completed_at'])} "
                 f"| кросс-докинг: {cross_str}"
             )
             for product_name, qty in supply_entry["items"]:
@@ -3856,7 +3857,7 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "📋 *Последние действия в базе:*\n\n"
     for row in rows:
         cp_name = (row.get("counterparties") or {}).get("name", "—")
-        msg += f"▫️ {row.get('operation_date','')} | {row.get('operation_type','')} | {cp_name} | *{row.get('amount')} ₽*\n"
+        msg += f"▫️ {_format_date_ru(row.get('operation_date'))} | {row.get('operation_type','')} | {cp_name} | *{row.get('amount')} ₽*\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
