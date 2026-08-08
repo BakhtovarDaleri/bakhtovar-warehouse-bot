@@ -496,6 +496,12 @@ class SupabaseService:
         )
         return res.data or []
 
+    def get_distinct_supply_clusters(self) -> list:
+        """ВРЕМЕННО (задача 4): все уникальные cluster, уже сохранённые из macrolocal_cluster_id —
+        сверяем их с результатом /v1/cluster/list, чтобы понять, тот же это ID-неймспейс или нет."""
+        res = self.client.table("ozon_supply_acceptances").select("cluster").not_.is_("cluster", "null").execute()
+        return sorted({r["cluster"] for r in (res.data or [])})
+
     def get_crossdocking_amounts_by_posting(self, posting_numbers: list) -> dict:
         """Сумма amount по operation_type='MarketplaceServiceItemCrossdocking', сгруппированная по
         posting_number (= supply_number). Крестдокинг не разбивается по SKU — сумма относится к поставке
@@ -3231,6 +3237,18 @@ async def fetch_ozon_supply_bundles(client_id: str, api_key: str, bundle_ids: li
     return result_by_bundle
 
 
+async def fetch_ozon_clusters(client_id: str, api_key: str) -> list:
+    """ВРЕМЕННО (задача 4, названия кластеров): /v1/cluster/list — метод и схема ({"clusters": [{"id",
+    "name", "type", "logistic_clusters":[...]}]}) подтверждены по исходникам стороннего Go-клиента
+    Ozon API (github.com/diPhantxm/ozon-api-client, ozon/clusters.go), а не живым вызовом — сам факт,
+    что id из этого справочника совпадает по значению с macrolocal_cluster_id, который мы уже храним
+    (например "4066"), ещё НЕ подтверждён. Запрашиваем без cluster_ids (весь справочник), чтобы свести
+    его с уже известными нам ID и проверить, получаются ли осмысленные русские названия регионов."""
+    data = await _ozon_api_post(client_id, api_key, "/v1/cluster/list", {"cluster_type": "CLUSTER_TYPE_OZON"})
+    result = data.get("result") or data
+    return result.get("clusters") or []
+
+
 async def collect_supply_acceptance_lines(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
     """Возвращает (lines, status_counts). Единица приёмки — ОТДЕЛЬНАЯ supply внутри order (не сам order):
     у order может быть несколько supplies, у каждой свой supply_id/state. supply_number для дедупа и
@@ -3397,6 +3415,27 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
     return updated
 
 
+async def _send_cluster_names_debug_dump(update: Update, db: "SupabaseService"):
+    """ВРЕМЕННО (задача 4, названия кластеров): сверяем уже сохранённые macrolocal_cluster_id со
+    справочником /v1/cluster/list — совпадают ли по значению ID и получаются ли осмысленные русские
+    названия регионов (сверяем со скриншотом: Калининград, Невинномысск, Казань...). Самодостаточная,
+    ловит свои ошибки — чтобы сбой здесь не портил основной поток синка поставок. Убрать вместе с
+    fetch_ozon_clusters/get_distinct_supply_clusters, как только результат подтверждён/опровергнут."""
+    try:
+        known_clusters = db.get_distinct_supply_clusters()
+        clusters = await fetch_ozon_clusters(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
+        name_by_id = {str(c.get("id")): c.get("name") for c in clusters}
+        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров всего.", "Сверка с уже известными cluster ID:"]
+        for cid in known_clusters:
+            lines.append(f"  {cid} -> {name_by_id.get(cid, 'НЕ НАЙДЕН')}")
+        text = "\n".join(lines)
+        for i in range(0, len(text), 3900):
+            await update.message.reply_text(text[i:i + 3900])
+    except Exception as e:
+        logger.exception("DEBUG (задача 4): не удалось получить /v1/cluster/list")
+        await update.message.reply_text(f"🐞 DEBUG (задача 4): не удалось получить /v1/cluster/list: {e}")
+
+
 async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     if context.bot_data.get("ozon_supply_sync_running"):
         await update.message.reply_text("⏳ Синхронизация приёмки уже идёт, подождите её завершения.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
@@ -3423,6 +3462,7 @@ async def _run_ozon_supply_sync_and_reply(update: Update, context: ContextTypes.
         await update.message.reply_text(f"⚠️ Ошибка синхронизации: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
     finally:
         context.bot_data["ozon_supply_sync_running"] = False
+    await _send_cluster_names_debug_dump(update, db)  # ВРЕМЕННО (задача 4)
 
 
 async def ozon_supply_sync_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
