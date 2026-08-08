@@ -3539,12 +3539,29 @@ def _round_rub(amount) -> int:
     return int(Decimal(str(amount)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
+def _split_amount_by_qty(total_amount: float, quantities: list) -> list:
+    """Делит total_amount между позициями пропорционально quantities (целые рубли, half-up на каждую
+    долю). Округление по отдельности может увести сумму долей от округлённого total_amount на 1₽ —
+    добираем разницу на последней позиции, чтобы сумма долей всегда сходилась с округлённым итогом."""
+    total_qty = sum(quantities)
+    target = _round_rub(total_amount)
+    if not total_qty or not quantities:
+        return [0] * len(quantities)
+    shares = [_round_rub(total_amount * (q / total_qty)) for q in quantities]
+    diff = target - sum(shares)
+    if diff:
+        shares[-1] += diff
+    return shares
+
+
 def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
     """Строит текст отчёта по поставкам, сгруппированный по заявке (order_number): заявка сверху с общей
-    датой отгрузки, внутри — её поставки с кластером/датой приёмки/товарами. Сумма кросс-докинга относится
-    к поставке целиком (Ozon не разбивает её по SKU), поэтому при подсчёте агрегата по кластеру берём её
-    один раз на supply_number, а не на каждую товарную строку — иначе сумма задвоится при нескольких SKU
-    в одной поставке. Суммы кросс-докинга округляются до целых рублей."""
+    датой отгрузки, внутри — её поставки с кластером/датой приёмки/товарами. Ozon отдаёт сумму кросс-докинга
+    на поставку целиком, не по SKU — для поставки с одним товаром вся сумма относится к нему, для поставки
+    с несколькими товарами делим пропорционально принятому количеству (_split_amount_by_qty). Агрегат по
+    кластеру считает сумму кросс-докинга один раз на supply_number (не на каждую строку), чтобы не задвоить
+    её при нескольких SKU в одной поставке — разбивка по товару ниже влияет только на отображение, не на
+    этот итог. Суммы кросс-докинга округляются до целых рублей."""
     if not rows:
         return "За выбранный период приёмок с проставленной датой приёмки не найдено."
 
@@ -3565,14 +3582,13 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict) -> str:
         lines.append(f"📋 Заявка {order_number} | отгрузка {_format_date_ru(order_entry['shipment_date'])}")
         for supply_number, supply_entry in order_entry["supplies"].items():
             cluster = supply_entry["cluster"]
+            items = supply_entry["items"]
             cross_amount = crossdock_by_supply.get(supply_number)
-            cross_str = f"{_round_rub(cross_amount)}₽" if cross_amount is not None else "нет данных"
-            lines.append(
-                f"  Поставка №{supply_number} | кластер {cluster} | приёмка {_format_date_ru(supply_entry['completed_at'])} "
-                f"| кросс-докинг: {cross_str}"
-            )
-            for product_name, qty in supply_entry["items"]:
-                lines.append(f"    {product_name} — {qty:.0f} шт")
+            item_shares = _split_amount_by_qty(cross_amount, [q for _, q in items]) if cross_amount is not None else [None] * len(items)
+            lines.append(f"  Поставка №{supply_number} | кластер {cluster} | приёмка {_format_date_ru(supply_entry['completed_at'])}")
+            for (product_name, qty), share in zip(items, item_shares):
+                share_str = f"{share}₽" if share is not None else "нет данных"
+                lines.append(f"    {product_name} — {qty:.0f} шт | кросс-докинг: {share_str}")
                 qty_by_cluster[cluster] = qty_by_cluster.get(cluster, 0) + qty
             supplies_by_cluster.setdefault(cluster, set()).add(supply_number)
         lines.append("")
