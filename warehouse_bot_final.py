@@ -3540,37 +3540,39 @@ def _cluster_label(cluster_id: str, cluster_names: dict) -> str:
     return cluster_names.get(cluster_id) or cluster_id
 
 
-def _format_rate(x: float) -> str:
-    """Ставка ₽/шт без лишних нулей: целое число без знаков после запятой, дробное — с двумя."""
-    r = round(x, 2)
-    return f"{r:.0f}" if r == int(r) else f"{r:.2f}"
-
-
-def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_names: dict) -> str:
-    """Строит текст отчёта по поставкам: каждая заявка — отдельная monospace-карточка (```...```) с
-    датами отгрузки/приёмки один раз на заявку (дата приёмки — order.state_updated_date, общая для всех
-    её поставок), дальше построчно её поставки. Ozon отдаёт сумму кросс-докинга на поставку целиком,
-    не по SKU — для поставки с одним товаром вся сумма относится к нему, для поставки с несколькими
-    товарами делим пропорционально принятому количеству (_split_amount_by_qty). "Стоимость за штуку"
-    считается по паре (кластер, товар), а не по одному кластеру — усреднение по кластеру целиком
-    размазывало бы расходы одного товара на другой, у которого кросс-докинга не было вовсе. Суммы/ставки
-    округляются до рубля/копеек соответственно. Группировка всё ещё идёт по сырому cluster ID —
-    cluster_names только подменяет то, что видит пользователь в тексте."""
+def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_names: dict, date_from: str, date_to: str) -> str:
+    """Строит текст отчёта по поставкам: сводка (заявок/поставок/штук/кросс-докинг за период) сверху,
+    дальше каждая заявка — отдельная monospace-карточка (```...```) с датами отгрузки/приёмки один раз
+    на заявку (дата приёмки — order.state_updated_date, общая для всех её поставок), построчно её
+    поставки. Ozon отдаёт сумму кросс-докинга на поставку целиком, не по SKU — для поставки с одним
+    товаром вся сумма относится к нему, для поставки с несколькими товарами делим пропорционально
+    принятому количеству (_split_amount_by_qty). И сводка, и построчный кросс-докинг считают сумму один
+    раз на supply_number (не на каждую товарную строку), чтобы не задвоить её при нескольких SKU в одной
+    поставке."""
     if not rows:
         return "За выбранный период приёмок с проставленной датой приёмки не найдено."
 
     orders = {}
+    order_numbers = set()
+    supply_numbers = set()
+    total_qty = 0.0
     for r in rows:
         order_number = r.get("order_number") or "без номера заявки"
         supply_number = r["supply_number"]
+        order_numbers.add(order_number)
+        supply_numbers.add(supply_number)
+        total_qty += float(r["accepted_qty"])
         order_entry = orders.setdefault(order_number, {"shipment_date": r.get("shipment_date"), "supplies": {}})
         supply_entry = order_entry["supplies"].setdefault(supply_number, {
             "cluster": r.get("cluster") or "—", "completed_at": r.get("supply_completed_at"), "items": [],
         })
         supply_entry["items"].append((r["product_name"], float(r["accepted_qty"])))
 
-    lines = ["📊 Отчёт по поставкам:\n"]
-    cost_by_cluster_product = {}  # (cluster, product_name) -> [total_cross, total_qty]
+    total_cross = sum(crossdock_by_supply.get(s, 0) for s in supply_numbers)
+    lines = [
+        f"📊 Отчёт по поставкам за {_format_date_ru(date_from)} — {_format_date_ru(date_to)}",
+        f"Заявок: {len(order_numbers)} | Поставок: {len(supply_numbers)} | Штук: {total_qty:.0f} | Кросс-докинг: {_round_rub(total_cross)}₽\n",
+    ]
     for order_number, order_entry in orders.items():
         card = [f"📋 {order_number}"]
         card.append(f"Отгрузка: {_format_date_ru(order_entry['shipment_date'])} → Приёмка: {_format_date_ru(next(iter(order_entry['supplies'].values()))['completed_at'])}")
@@ -3591,18 +3593,7 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_name
                     share_str = f"{share}₽" if share is not None else "нет данных"
                     card.append(f"    {product_name} {qty:.0f} шт, кросс-докинг {share_str}")
 
-            for (product_name, qty), share in zip(items, item_shares):
-                key = (cluster, product_name)
-                entry = cost_by_cluster_product.setdefault(key, [0.0, 0.0])
-                entry[0] += share if share is not None else 0
-                entry[1] += qty
-
         lines.append("```\n" + "\n".join(card) + "\n```")
-
-    lines.append("📦 Стоимость за штуку:")
-    for (cluster, product_name), (total_cross, total_qty) in cost_by_cluster_product.items():
-        per_unit = (total_cross / total_qty) if total_qty else 0
-        lines.append(f"  {_cluster_label(cluster, cluster_names)} — {product_name}: {_format_rate(per_unit)}₽/шт ({total_qty:.0f} шт)")
 
     return "\n".join(lines)
 
@@ -3636,7 +3627,7 @@ async def _run_ozon_supply_report_and_reply(update: Update, context: ContextType
     except Exception:
         logger.exception("Не удалось получить /v1/cluster/list для отчёта по поставкам")
         cluster_names = {}
-    text = build_supply_report_text(rows, crossdock_by_supply, cluster_names)
+    text = build_supply_report_text(rows, crossdock_by_supply, cluster_names, date_from, date_to)
     for chunk in _chunk_text_by_lines(text):
         await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(update.effective_user.id))
 
