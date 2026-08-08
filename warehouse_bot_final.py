@@ -3537,19 +3537,30 @@ def _split_amount_by_qty(total_amount: float, quantities: list) -> list:
 def _cluster_label(cluster_id: str, cluster_names: dict) -> str:
     """Название кластера, если нашлось в справочнике /v1/cluster/list, иначе — сырой ID (не молчим,
     чтобы было видно, что справочник не покрывает этот конкретный ID, а не что кластера нет вовсе)."""
-    name = cluster_names.get(cluster_id)
-    return f"{name} ({cluster_id})" if name else cluster_id
+    return cluster_names.get(cluster_id) or cluster_id
+
+
+def _format_date_short(raw) -> str:
+    """ГГГГ-ММ-ДД -> ДД.ММ, без года — для компактной пары "отгрузка→приёмка" в одной строке."""
+    if not raw:
+        return "—"
+    parts = str(raw)[:10].split("-")
+    if len(parts) == 3:
+        _, m, d = parts
+        return f"{d}.{m}"
+    return str(raw)[:10]
 
 
 def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_names: dict) -> str:
-    """Строит текст отчёта по поставкам, сгруппированный по заявке (order_number): заявка сверху с общей
-    датой отгрузки, внутри — её поставки с кластером/датой приёмки/товарами. Ozon отдаёт сумму кросс-докинга
-    на поставку целиком, не по SKU — для поставки с одним товаром вся сумма относится к нему, для поставки
-    с несколькими товарами делим пропорционально принятому количеству (_split_amount_by_qty). Агрегат по
-    кластеру считает сумму кросс-докинга один раз на supply_number (не на каждую строку), чтобы не задвоить
-    её при нескольких SKU в одной поставке — разбивка по товару ниже влияет только на отображение, не на
-    этот итог. Суммы кросс-докинга округляются до целых рублей. Группировка/агрегация всё ещё идёт по
-    сырому cluster ID — cluster_names только подменяет то, что видит пользователь в тексте."""
+    """Строит текст отчёта по поставкам, сгруппированный по заявке (order_number, жирным). Ozon отдаёт
+    сумму кросс-докинга на поставку целиком, не по SKU — для поставки с одним товаром вся сумма относится
+    к нему, для поставки с несколькими товарами делим пропорционально принятому количеству
+    (_split_amount_by_qty). Агрегат по кластеру считает сумму кросс-докинга один раз на supply_number
+    (не на каждую строку), чтобы не задвоить её при нескольких SKU в одной поставке — разбивка по товару
+    влияет только на отображение, не на этот итог. Суммы кросс-докинга округляются до целых рублей.
+    Группировка/агрегация всё ещё идёт по сырому cluster ID — cluster_names только подменяет то, что
+    видит пользователь в тексте. *жирный* — синтаксис легаси-Markdown Telegram (одна звёздочка), не
+    CommonMark **жирный** — с двойными звёздочками в parse_mode="Markdown" ничего не выделится."""
     if not rows:
         return "За выбранный период приёмок с проставленной датой приёмки не найдено."
 
@@ -3567,16 +3578,18 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_name
     qty_by_cluster = {}
     supplies_by_cluster = {}
     for order_number, order_entry in orders.items():
-        lines.append(f"📋 Заявка {order_number} | отгрузка {_format_date_ru(order_entry['shipment_date'])}")
+        lines.append(f"📋 *{order_number}*")
+        shipment_short = _format_date_short(order_entry["shipment_date"])
         for supply_number, supply_entry in order_entry["supplies"].items():
             cluster = supply_entry["cluster"]
             items = supply_entry["items"]
             cross_amount = crossdock_by_supply.get(supply_number)
             item_shares = _split_amount_by_qty(cross_amount, [q for _, q in items]) if cross_amount is not None else [None] * len(items)
-            lines.append(f"  Поставка №{supply_number} | кластер {_cluster_label(cluster, cluster_names)} | приёмка {_format_date_ru(supply_entry['completed_at'])}")
+            completed_short = _format_date_short(supply_entry["completed_at"])
+            lines.append(f"  {supply_number} — {_cluster_label(cluster, cluster_names)}, {shipment_short}→{completed_short}")
             for (product_name, qty), share in zip(items, item_shares):
                 share_str = f"{share}₽" if share is not None else "нет данных"
-                lines.append(f"    {product_name} — {qty:.0f} шт | кросс-докинг: {share_str}")
+                lines.append(f"    {product_name} {qty:.0f} шт, кросс-докинг {share_str}")
                 qty_by_cluster[cluster] = qty_by_cluster.get(cluster, 0) + qty
             supplies_by_cluster.setdefault(cluster, set()).add(supply_number)
         lines.append("")
@@ -3591,6 +3604,24 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_name
     return "\n".join(lines)
 
 
+def _chunk_text_by_lines(text: str, limit: int = 3900) -> list:
+    """Бьёт текст на части по границам строк, а не по сырому смещению символов — иначе разрез мог бы
+    попасть прямо внутрь Markdown-разметки (например *жирный* номер заявки), разорвав пару звёздочек
+    между двумя сообщениями и оставив в одном из них "сырую" непарную звёздочку."""
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def _run_ozon_supply_report_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
     db = context.bot_data.get("db")
     rows = db.get_supply_acceptance_report_rows(date_from, date_to)
@@ -3603,8 +3634,8 @@ async def _run_ozon_supply_report_and_reply(update: Update, context: ContextType
         logger.exception("Не удалось получить /v1/cluster/list для отчёта по поставкам")
         cluster_names = {}
     text = build_supply_report_text(rows, crossdock_by_supply, cluster_names)
-    for i in range(0, len(text), 3900):
-        await update.message.reply_text(text[i:i + 3900], reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    for chunk in _chunk_text_by_lines(text):
+        await update.message.reply_text(chunk, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(update.effective_user.id))
 
 
 async def ozon_supply_report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
