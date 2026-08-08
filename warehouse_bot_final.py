@@ -3415,22 +3415,47 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
     return updated
 
 
+def _find_matching_nested_ids(obj, known_ids: set, path: str = "clusters") -> list:
+    """Рекурсивно обходит весь ответ /v1/cluster/list (включая logistic_clusters/warehouses) и ищет
+    любое поле, оканчивающееся на "id", значение которого совпадает с одним из наших known macrolocal
+    cluster ID — не гадаем заранее, в каком именно вложенном поле может быть совпадение."""
+    matches = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower().endswith("id") and str(v) in known_ids:
+                matches.append(f"{path}.{k} = {v!r}")
+            matches.extend(_find_matching_nested_ids(v, known_ids, f"{path}.{k}"))
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            matches.extend(_find_matching_nested_ids(item, known_ids, f"{path}[{i}]"))
+    return matches
+
+
 async def _send_cluster_names_debug_dump(update: Update, db: "SupabaseService"):
-    """ВРЕМЕННО (задача 4, названия кластеров): 0 из 22 известных macrolocal_cluster_id совпало со
-    справочником /v1/cluster/list при первой проверке (сверка уже сравнивала строки — str(id) — так что
-    несовпадение типов int/str тут ни при чём). Прежде чем делать вывод о другом неймспейсе, выводим
-    ВЕСЬ сырой список id+name+type без всякой фильтрации/сверки — чтобы увидеть реальный диапазон id и
-    реальные названия своими глазами. Самодостаточная, ловит свои ошибки — чтобы сбой здесь не портил
-    основной поток синка поставок. Убрать вместе с fetch_ozon_clusters/get_distinct_supply_clusters,
-    как только результат подтверждён/опровергнут."""
+    """ВРЕМЕННО (задача 4, названия кластеров): диапазоны id верхнего уровня совсем разные (2-193 у
+    /v1/cluster/list vs 4002-4077 у наших macrolocal_cluster_id) — 0 из 22 не совпало, и это не
+    совпадение количества (22=22), рискованно сопоставлять по позиции. Следующая гипотеза: наш ID может
+    совпадать с чем-то ВНУТРИ вложенного logistic_clusters/warehouses, которое мы раньше не смотрели.
+    Показываем полную структуру ОДНОГО элемента clusters[] целиком (с logistic_clusters) для ручного
+    осмотра, плюс автоматический рекурсивный поиск known ID по ВСЕМ вложенным полям — если и там ничего
+    не найдётся, это будет означать, что macrolocal_cluster_id и cluster.id — разные, несвязанные
+    понятия, и не стоит выдумывать связь. Самодостаточная, ловит свои ошибки. Убрать вместе с
+    fetch_ozon_clusters/get_distinct_supply_clusters/_find_matching_nested_ids по завершении задачи 4."""
     try:
         known_clusters = db.get_distinct_supply_clusters()
         clusters = await fetch_ozon_clusters(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
-        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров, сырой список:"]
-        for c in clusters:
-            raw_id = c.get("id")
-            lines.append(f"  id={raw_id!r} ({type(raw_id).__name__}) | name={c.get('name')!r} | type={c.get('type')!r}")
+
+        matches = _find_matching_nested_ids(clusters, set(known_clusters))
+        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров."]
+        if matches:
+            lines.append(f"Совпадения known ID во вложенных полях ({len(matches)}):")
+            lines.extend(f"  {m}" for m in matches)
+        else:
+            lines.append("Совпадений known ID нигде во вложенной структуре НЕ найдено.")
         lines.append(f"\nНаши известные cluster ID (из БД): {', '.join(known_clusters)}")
+        lines.append("\nПолная структура одного элемента clusters[0]:")
+        lines.append(json.dumps(clusters[0] if clusters else {}, ensure_ascii=False, indent=2, default=str))
+
         text = "\n".join(lines)
         for i in range(0, len(text), 3900):
             await update.message.reply_text(text[i:i + 3900])
