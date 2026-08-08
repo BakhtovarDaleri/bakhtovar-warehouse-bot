@@ -3416,18 +3416,21 @@ async def backfill_supply_acceptance_extra_fields(db: "SupabaseService", client_
 
 
 async def _send_cluster_names_debug_dump(update: Update, db: "SupabaseService"):
-    """ВРЕМЕННО (задача 4, названия кластеров): сверяем уже сохранённые macrolocal_cluster_id со
-    справочником /v1/cluster/list — совпадают ли по значению ID и получаются ли осмысленные русские
-    названия регионов (сверяем со скриншотом: Калининград, Невинномысск, Казань...). Самодостаточная,
-    ловит свои ошибки — чтобы сбой здесь не портил основной поток синка поставок. Убрать вместе с
-    fetch_ozon_clusters/get_distinct_supply_clusters, как только результат подтверждён/опровергнут."""
+    """ВРЕМЕННО (задача 4, названия кластеров): 0 из 22 известных macrolocal_cluster_id совпало со
+    справочником /v1/cluster/list при первой проверке (сверка уже сравнивала строки — str(id) — так что
+    несовпадение типов int/str тут ни при чём). Прежде чем делать вывод о другом неймспейсе, выводим
+    ВЕСЬ сырой список id+name+type без всякой фильтрации/сверки — чтобы увидеть реальный диапазон id и
+    реальные названия своими глазами. Самодостаточная, ловит свои ошибки — чтобы сбой здесь не портил
+    основной поток синка поставок. Убрать вместе с fetch_ozon_clusters/get_distinct_supply_clusters,
+    как только результат подтверждён/опровергнут."""
     try:
         known_clusters = db.get_distinct_supply_clusters()
         clusters = await fetch_ozon_clusters(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)
-        name_by_id = {str(c.get("id")): c.get("name") for c in clusters}
-        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров всего.", "Сверка с уже известными cluster ID:"]
-        for cid in known_clusters:
-            lines.append(f"  {cid} -> {name_by_id.get(cid, 'НЕ НАЙДЕН')}")
+        lines = [f"🐞 DEBUG (задача 4) — /v1/cluster/list вернул {len(clusters)} кластеров, сырой список:"]
+        for c in clusters:
+            raw_id = c.get("id")
+            lines.append(f"  id={raw_id!r} ({type(raw_id).__name__}) | name={c.get('name')!r} | type={c.get('type')!r}")
+        lines.append(f"\nНаши известные cluster ID (из БД): {', '.join(known_clusters)}")
         text = "\n".join(lines)
         for i in range(0, len(text), 3900):
             await update.message.reply_text(text[i:i + 3900])
