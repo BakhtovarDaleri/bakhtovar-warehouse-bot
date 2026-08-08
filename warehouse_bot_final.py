@@ -3599,18 +3599,24 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_name
 
 
 def _chunk_text_by_lines(text: str, limit: int = 3900) -> list:
-    """Бьёт текст на части по границам строк, а не по сырому смещению символов — иначе разрез мог бы
-    попасть прямо внутрь Markdown-разметки (например *жирный* номер заявки), разорвав пару звёздочек
-    между двумя сообщениями и оставив в одном из них "сырую" непарную звёздочку."""
+    """Бьёт текст на части по границам строк — но, что важнее, никогда не режет ВНУТРИ ```-блока
+    (карточки заявок в отчёте по поставкам — многострочные code-block'и). Прежняя версия уважала только
+    границы строк, но не парность ``` — на длинных периодах разрез мог попасть между открывающим и
+    закрывающим ``` одной карточки, оставляя в одном сообщении незакрытый code-block. Telegram на это
+    отвечает "Can't parse entities: can't find end of the entity" и всё сообщение не доходит. Пока мы
+    внутри ```-блока, лимит не применяется — сначала дожидаемся его закрытия, потом режем."""
     chunks = []
     current = ""
+    in_fence = False
     for line in text.split("\n"):
         candidate = f"{current}\n{line}" if current else line
-        if len(candidate) > limit and current:
+        if len(candidate) > limit and current and not in_fence:
             chunks.append(current)
             current = line
         else:
             current = candidate
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
     if current:
         chunks.append(current)
     return chunks
