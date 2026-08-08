@@ -3540,27 +3540,22 @@ def _cluster_label(cluster_id: str, cluster_names: dict) -> str:
     return cluster_names.get(cluster_id) or cluster_id
 
 
-def _format_date_short(raw) -> str:
-    """ГГГГ-ММ-ДД -> ДД.ММ, без года — для компактной пары "отгрузка→приёмка" в одной строке."""
-    if not raw:
-        return "—"
-    parts = str(raw)[:10].split("-")
-    if len(parts) == 3:
-        _, m, d = parts
-        return f"{d}.{m}"
-    return str(raw)[:10]
+def _format_rate(x: float) -> str:
+    """Ставка ₽/шт без лишних нулей: целое число без знаков после запятой, дробное — с двумя."""
+    r = round(x, 2)
+    return f"{r:.0f}" if r == int(r) else f"{r:.2f}"
 
 
 def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_names: dict) -> str:
-    """Строит текст отчёта по поставкам, сгруппированный по заявке (order_number, жирным). Ozon отдаёт
-    сумму кросс-докинга на поставку целиком, не по SKU — для поставки с одним товаром вся сумма относится
-    к нему, для поставки с несколькими товарами делим пропорционально принятому количеству
-    (_split_amount_by_qty). Агрегат по кластеру считает сумму кросс-докинга один раз на supply_number
-    (не на каждую строку), чтобы не задвоить её при нескольких SKU в одной поставке — разбивка по товару
-    влияет только на отображение, не на этот итог. Суммы кросс-докинга округляются до целых рублей.
-    Группировка/агрегация всё ещё идёт по сырому cluster ID — cluster_names только подменяет то, что
-    видит пользователь в тексте. *жирный* — синтаксис легаси-Markdown Telegram (одна звёздочка), не
-    CommonMark **жирный** — с двойными звёздочками в parse_mode="Markdown" ничего не выделится."""
+    """Строит текст отчёта по поставкам: каждая заявка — отдельная monospace-карточка (```...```) с
+    датами отгрузки/приёмки один раз на заявку (дата приёмки — order.state_updated_date, общая для всех
+    её поставок), дальше построчно её поставки. Ozon отдаёт сумму кросс-докинга на поставку целиком,
+    не по SKU — для поставки с одним товаром вся сумма относится к нему, для поставки с несколькими
+    товарами делим пропорционально принятому количеству (_split_amount_by_qty). "Стоимость за штуку"
+    считается по паре (кластер, товар), а не по одному кластеру — усреднение по кластеру целиком
+    размазывало бы расходы одного товара на другой, у которого кросс-докинга не было вовсе. Суммы/ставки
+    округляются до рубля/копеек соответственно. Группировка всё ещё идёт по сырому cluster ID —
+    cluster_names только подменяет то, что видит пользователь в тексте."""
     if not rows:
         return "За выбранный период приёмок с проставленной датой приёмки не найдено."
 
@@ -3575,31 +3570,39 @@ def build_supply_report_text(rows: list, crossdock_by_supply: dict, cluster_name
         supply_entry["items"].append((r["product_name"], float(r["accepted_qty"])))
 
     lines = ["📊 Отчёт по поставкам:\n"]
-    qty_by_cluster = {}
-    supplies_by_cluster = {}
+    cost_by_cluster_product = {}  # (cluster, product_name) -> [total_cross, total_qty]
     for order_number, order_entry in orders.items():
-        lines.append(f"📋 *{order_number}*")
-        shipment_short = _format_date_short(order_entry["shipment_date"])
+        card = [f"📋 {order_number}"]
+        card.append(f"Отгрузка: {_format_date_ru(order_entry['shipment_date'])} → Приёмка: {_format_date_ru(next(iter(order_entry['supplies'].values()))['completed_at'])}")
         for supply_number, supply_entry in order_entry["supplies"].items():
             cluster = supply_entry["cluster"]
+            cluster_label = _cluster_label(cluster, cluster_names)
             items = supply_entry["items"]
             cross_amount = crossdock_by_supply.get(supply_number)
             item_shares = _split_amount_by_qty(cross_amount, [q for _, q in items]) if cross_amount is not None else [None] * len(items)
-            completed_short = _format_date_short(supply_entry["completed_at"])
-            lines.append(f"  {supply_number} — {_cluster_label(cluster, cluster_names)}, {shipment_short}→{completed_short}")
-            for (product_name, qty), share in zip(items, item_shares):
-                share_str = f"{share}₽" if share is not None else "нет данных"
-                lines.append(f"    {product_name} {qty:.0f} шт, кросс-докинг {share_str}")
-                qty_by_cluster[cluster] = qty_by_cluster.get(cluster, 0) + qty
-            supplies_by_cluster.setdefault(cluster, set()).add(supply_number)
-        lines.append("")
 
-    lines.append("📦 Стоимость за штуку по кластеру:")
-    for cluster, supply_set in supplies_by_cluster.items():
-        total_cross = sum(crossdock_by_supply.get(s, 0) for s in supply_set)
-        total_qty = qty_by_cluster[cluster]
+            if len(items) == 1:
+                (product_name, qty), share = items[0], item_shares[0]
+                share_str = f"{share}₽" if share is not None else "нет данных"
+                card.append(f"  {supply_number} — {product_name} {qty:.0f} шт, {cluster_label}, кросс-докинг {share_str}")
+            else:
+                card.append(f"  {supply_number} — {cluster_label}:")
+                for (product_name, qty), share in zip(items, item_shares):
+                    share_str = f"{share}₽" if share is not None else "нет данных"
+                    card.append(f"    {product_name} {qty:.0f} шт, кросс-докинг {share_str}")
+
+            for (product_name, qty), share in zip(items, item_shares):
+                key = (cluster, product_name)
+                entry = cost_by_cluster_product.setdefault(key, [0.0, 0.0])
+                entry[0] += share if share is not None else 0
+                entry[1] += qty
+
+        lines.append("```\n" + "\n".join(card) + "\n```")
+
+    lines.append("📦 Стоимость за штуку:")
+    for (cluster, product_name), (total_cross, total_qty) in cost_by_cluster_product.items():
         per_unit = (total_cross / total_qty) if total_qty else 0
-        lines.append(f"  {_cluster_label(cluster, cluster_names)}: {_round_rub(total_cross)}₽ / {total_qty:.0f} шт = {per_unit:.2f}₽/шт")
+        lines.append(f"  {_cluster_label(cluster, cluster_names)} — {product_name}: {_format_rate(per_unit)}₽/шт ({total_qty:.0f} шт)")
 
     return "\n".join(lines)
 
