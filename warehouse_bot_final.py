@@ -852,7 +852,7 @@ def get_main_menu_keyboard(user_id):
         kb[3].append("⏰ Напомнить")
         kb.append(["🔄 Синхр. Ozon", "🔄 Синхр. отзывы"])
         kb.append(["📦 Приёмка Ozon", "📊 Отчёт по поставкам"])
-        kb.append(["💰 Выплаты Ozon"])
+        kb.append(["💰 Выплаты Ozon", "📦 Остатки Ozon"])
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -3790,6 +3790,152 @@ async def ozon_payouts_period_custom(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
+# --- Ozon Остатки (задача: полная картина остатков без задвоения между категориями) ---
+STOCK_DEBUG_SKUS = [4839976987, 4839932178]  # Боярышник, Шиповник — тестовые SKU для сверки структуры
+STOCK_RECONCILE_DATE_FROM = "2026-08-02"  # период со скриншота приложения Ozon, для сверки сумм по статусам
+STOCK_RECONCILE_DATE_TO = "2026-08-16"
+STOCK_RECONCILE_REFERENCE = "Ожидают сборки 138, Готовы к отгрузке 117, Доставляются 1433, Доставлены 4064, Отменены 166 (итого 5918)"
+
+
+def _truncate_lists(obj, max_items: int = 2):
+    """Обрезает все списки в структуре до первых max_items элементов — компактный DEBUG-дамп без
+    привязки к ещё неизвестным путям полей (нельзя фильтровать по SKU, пока не знаем, где он лежит)."""
+    if isinstance(obj, list):
+        return [_truncate_lists(x, max_items) for x in obj[:max_items]]
+    if isinstance(obj, dict):
+        return {k: _truncate_lists(v, max_items) for k, v in obj.items()}
+    return obj
+
+
+async def fetch_ozon_analytics_stocks_raw(client_id: str, api_key: str, skus: list) -> dict:
+    """ВРЕМЕННО: /v1/analytics/stocks — метод подтверждён в справочнике Ozon for dev (пользователем).
+    Схема запроса {"skus":[...]} и полей ответа (available/valid/waiting_docs/expiring/transit/
+    transit_defect/stock_defect/excess/requested/return_from_customer/return_to_seller — отдельные
+    именованные счётчики, не один статус на единицу) взята из community Go-клиента, живым вызовом
+    не подтверждена."""
+    return await _ozon_api_post(client_id, api_key, "/v1/analytics/stocks", {"skus": skus})
+
+
+async def fetch_ozon_product_stocks_raw(client_id: str, api_key: str) -> dict:
+    """ВРЕМЕННО: /v4/product/info/stocks — схема запроса {"filter": {"visibility": "ALL"}, "limit": 1000,
+    "last_id": ""} и ответа (items[].stocks[] = {"type": "fbo"/"fbs", "present", "reserved"}) взята из
+    community-клиента, живым вызовом не подтверждена."""
+    return await _ozon_api_post(client_id, api_key, "/v4/product/info/stocks", {
+        "filter": {"visibility": "ALL"}, "limit": 1000, "last_id": "",
+    })
+
+
+async def fetch_ozon_returns_raw(client_id: str, api_key: str) -> dict:
+    """ВРЕМЕННО: /v1/returns/list — схема запроса {"filter": {}, "limit", "last_id"} и ответа
+    (returns[].visual.status — дискретный статус на единицу возврата, returns[].product.{sku,quantity})
+    взята из community-клиента, живым вызовом не подтверждена."""
+    return await _ozon_api_post(client_id, api_key, "/v1/returns/list", {"filter": {}, "limit": 100, "last_id": 0})
+
+
+async def fetch_ozon_fbo_postings_page(client_id: str, api_key: str, date_from: str, date_to: str, offset: int, limit: int = 1000) -> list:
+    """ВРЕМЕННО: /v2/posting/fbo/list — схема запроса {"dir","filter":{"since","to"},"limit","offset",
+    "translit","with"} и ответа (result[].status — дискретный статус на отправление, result[].products[]
+    .{sku,quantity}) взята из community-клиента. Пагинация — по offset (не last_id), тоже неподтверждено.
+    Ответ на разных клиентах оборачивался то в "result" как список, то как {"postings"/"items": [...]} —
+    поддерживаем оба варианта, не гадая, какой из них реальный, пока не увидим сами."""
+    body = {
+        "dir": "ASC",
+        "filter": {"since": f"{date_from}T00:00:00.000Z", "to": f"{date_to}T23:59:59.000Z"},
+        "limit": limit, "offset": offset, "translit": True,
+        "with": {"analytics_data": False, "financial_data": False},
+    }
+    data = await _ozon_api_post(client_id, api_key, "/v2/posting/fbo/list", body)
+    result = data.get("result")
+    if result is None:
+        result = data
+    if isinstance(result, dict):
+        return result.get("postings") or result.get("items") or []
+    return result or []
+
+
+async def _reconcile_fbo_status_counts(client_id: str, api_key: str, date_from: str, date_to: str) -> tuple:
+    """Полная пагинация /v2/posting/fbo/list за период по ВСЕМ SKU, агрегация по status: и количество
+    отправлений, и сумма quantity по товарам внутри — для сверки с цифрами из приложения Ozon
+    (STOCK_RECONCILE_REFERENCE). Возвращает (posting_counts, unit_sums, один сырой пример отправления)."""
+    offset = 0
+    limit = 1000
+    posting_counts = {}
+    unit_sums = {}
+    sample = None
+    while True:
+        postings = await fetch_ozon_fbo_postings_page(client_id, api_key, date_from, date_to, offset, limit)
+        if not postings:
+            break
+        if sample is None:
+            sample = postings[0]
+        for p in postings:
+            status = p.get("status") or "неизвестно"
+            posting_counts[status] = posting_counts.get(status, 0) + 1
+            qty = sum((item.get("quantity") or 0) for item in (p.get("products") or []))
+            unit_sums[status] = unit_sums.get(status, 0) + qty
+        if len(postings) < limit:
+            break
+        offset += limit
+        await asyncio.sleep(0.3)
+    return posting_counts, unit_sums, sample
+
+
+async def _run_ozon_stock_debug_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔄 Проверяю 4 метода Ozon по остаткам + сверяю статусы отправлений, подождите (может занять минуту)...", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+
+    checks = [
+        ("/v1/analytics/stocks", lambda: fetch_ozon_analytics_stocks_raw(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, STOCK_DEBUG_SKUS)),
+        ("/v4/product/info/stocks", lambda: fetch_ozon_product_stocks_raw(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)),
+        ("/v1/returns/list", lambda: fetch_ozon_returns_raw(OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY)),
+    ]
+    for name, call in checks:
+        try:
+            data = await call()
+            text = f"🐞 DEBUG — {name}:\n" + json.dumps(_truncate_lists(data), ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            logger.exception(f"DEBUG: не удалось получить {name}")
+            text = f"⚠️ {name}: ошибка запроса: {e}"
+        for chunk in _chunk_text_by_lines(text):
+            await update.message.reply_text(chunk)
+        await asyncio.sleep(0.4)
+
+    try:
+        posting_counts, unit_sums, sample = await _reconcile_fbo_status_counts(
+            OZON_BULAT_CLIENT_ID, OZON_BULAT_API_KEY, STOCK_RECONCILE_DATE_FROM, STOCK_RECONCILE_DATE_TO,
+        )
+        lines = [
+            f"🐞 DEBUG — /v2/posting/fbo/list, сверка статусов за {_format_date_ru(STOCK_RECONCILE_DATE_FROM)} — {_format_date_ru(STOCK_RECONCILE_DATE_TO)} (все SKU):",
+            "\nПо количеству отправлений (posting):",
+        ]
+        for status, count in sorted(posting_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  {status}: {count}")
+        lines.append("\nПо сумме quantity внутри отправлений:")
+        for status, qty in sorted(unit_sums.items(), key=lambda x: -x[1]):
+            lines.append(f"  {status}: {qty}")
+        lines.append(f"\nСправочно, твои цифры из приложения Ozon: {STOCK_RECONCILE_REFERENCE}")
+        lines.append("\nПример одного сырого отправления:")
+        lines.append(json.dumps(sample, ensure_ascii=False, indent=2, default=str))
+        text = "\n".join(lines)
+        for chunk in _chunk_text_by_lines(text):
+            await update.message.reply_text(chunk)
+    except Exception as e:
+        logger.exception("DEBUG: не удалось сверить статусы /v2/posting/fbo/list")
+        await update.message.reply_text(f"⚠️ Сверка статусов не удалась: {e}", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        return
+
+    await update.message.reply_text("✅ DEBUG по остаткам Ozon завершён.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+
+
+async def ozon_stock_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ВРЕМЕННАЯ команда — только диагностика, без сохранения. Уберём вместе с проверкой полей."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not (OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY):
+        await update.message.reply_text("⚠️ Ключи Ozon ещё не настроены в переменных окружения.")
+        return
+    await _run_ozon_stock_debug_and_reply(update, context)
+
+
 # --- REMINDERS ---
 async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
@@ -4042,7 +4188,7 @@ def main():
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -4054,7 +4200,7 @@ def main():
             PAYMENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAYMENT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     history_conv = ConversationHandler(
@@ -4065,7 +4211,7 @@ def main():
             HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
             HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
             HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     warehouse_conv = ConversationHandler(
@@ -4102,7 +4248,7 @@ def main():
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
             EMP_ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     sale_conv = ConversationHandler(
@@ -4110,7 +4256,7 @@ def main():
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     balance_conv = ConversationHandler(
@@ -4119,7 +4265,7 @@ def main():
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
             BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
         },
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     reminder_conv = ConversationHandler(
@@ -4129,7 +4275,7 @@ def main():
             REMINDER_INPUT_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_input_flow)],
             REMINDER_DATE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_date_select)],
             REMINDER_TIME_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_select)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     add_conv = ConversationHandler(
@@ -4144,7 +4290,7 @@ def main():
             DELETE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_type)],
             DELETE_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item)],
             DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -4164,42 +4310,43 @@ def main():
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. отзывы$"), ozon_feedback_sync_start)],
         states={
             OZON_FEEDBACK_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period)],
             OZON_FEEDBACK_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(feedback_edit_start, pattern="^ozfb_edit_")],
         states={
             FEEDBACK_EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_edit_text)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📦 Приёмка Ozon$"), ozon_supply_sync_start)],
         states={
             OZON_SUPPLY_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_sync_period)],
             OZON_SUPPLY_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт по поставкам$"), ozon_supply_report_start)],
         states={
             OZON_SUPPLY_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_report_period)],
             OZON_SUPPLY_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_report_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Выплаты Ozon$"), ozon_payouts_start)],
         states={
             OZON_PAYOUTS_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period)],
             OZON_PAYOUTS_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon)$"), cancel_to_menu)]
     ))
+    application.add_handler(MessageHandler(filters.Regex("^📦 Остатки Ozon$"), ozon_stock_debug))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY:
