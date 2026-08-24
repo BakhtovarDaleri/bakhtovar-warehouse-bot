@@ -287,6 +287,51 @@ class SupabaseService:
         )
         return res.data or []
 
+    def get_purchases_report_rows(self, category_id: int, date_from: str, date_to: str) -> list:
+        """Закупки (сырьё или расходники, по category_id) за период — для read-only отчётов роли
+        'бухгалтер'. Те же поля, что пишет supply_confirm: item_name/quantity/price/amount/counterparty."""
+        res = (
+            self.client.table("operations")
+            .select("operation_date,item_name,quantity,price,amount,counterparties(name)")
+            .eq("category_id", category_id)
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .order("operation_date")
+            .execute()
+        )
+        return res.data or []
+
+    def get_salary_report_rows(self, date_from: str, date_to: str) -> list:
+        """Начисления зарплаты (category 'Зарплата') за период — read-only отчёт роли 'бухгалтер'."""
+        cat_id = self.get_category_id("Зарплата")
+        res = (
+            self.client.table("operations")
+            .select("operation_date,amount,comment,counterparties(name)")
+            .eq("category_id", cat_id)
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .order("operation_date")
+            .execute()
+        )
+        return res.data or []
+
+    def get_other_warehouse_expenses_rows(self, exclude_category_ids: list, date_from: str, date_to: str) -> list:
+        """Прочие расходы склада (весь group_name='склад' в categories, КРОМЕ закупки сырья/расходников —
+        у них уже свои отдельные отчёты) за период — read-only отчёт роли 'бухгалтер'."""
+        cat_ids = [
+            c["id"] for c in (self.client.table("categories").select("id").eq("group_name", "склад").execute().data or [])
+            if c["id"] not in exclude_category_ids
+        ]
+        if not cat_ids:
+            return []
+        res = (
+            self.client.table("operations")
+            .select("operation_date,amount,comment,categories(name),counterparties(name)")
+            .in_("category_id", cat_ids)
+            .gte("operation_date", date_from).lte("operation_date", date_to)
+            .order("operation_date")
+            .execute()
+        )
+        return res.data or []
+
     def get_all_debts(self):
         """Баланс по каждому контрагенту сразу — для сводного отчёта по всем долгам."""
         ops = self.client.table("operations").select("counterparty_id,amount").execute().data or []
@@ -717,6 +762,22 @@ class SupabaseService:
         res = self.client.table("pending_approvals").select("id").eq("user_id", user_id).eq("status", "pending").execute()
         return len(res.data or []) > 0
 
+    def get_user_role(self, user_id: int) -> str:
+        """'admin' — отдельная проверка через ADMIN_ID, не через колонку role (по инструкции — не трогать
+        эту часть). Для остальных — role из approved_users, по умолчанию 'staff' (текущее поведение)."""
+        if user_id == ADMIN_ID:
+            return "admin"
+        res = self.client.table("approved_users").select("role").eq("user_id", user_id).limit(1).execute()
+        data = res.data or []
+        return (data[0].get("role") if data else None) or "staff"
+
+    def get_approved_users_list(self) -> list:
+        res = self.client.table("approved_users").select("user_id,name,phone,role").order("name").execute()
+        return res.data or []
+
+    def set_user_role(self, user_id: int, role: str):
+        self.client.table("approved_users").update({"role": role}).eq("user_id", user_id).execute()
+
     # --- Reminders ---
     def add_reminder(self, remind_at_iso: str, category: str, description: str):
         self.client.table("reminders").insert(
@@ -832,6 +893,10 @@ OZON_PAYOUTS_PERIOD = "OZON_PAYOUTS_PERIOD"
 OZON_PAYOUTS_PERIOD_CUSTOM = "OZON_PAYOUTS_PERIOD_CUSTOM"
 PERF_ORDER_REPORT_CAMPAIGNS = "PERF_ORDER_REPORT_CAMPAIGNS"
 PERF_CHECK_REPORT_UUID = "PERF_CHECK_REPORT_UUID"
+ACC_REPORT_PERIOD = "ACC_REPORT_PERIOD"
+ACC_REPORT_PERIOD_CUSTOM = "ACC_REPORT_PERIOD_CUSTOM"
+ROLE_ASSIGN_USER = "ROLE_ASSIGN_USER"
+ROLE_ASSIGN_ROLE = "ROLE_ASSIGN_ROLE"
 
 
 
@@ -855,15 +920,25 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
     return ReplyKeyboardMarkup(grid, resize_keyboard=True)
 
 
-def get_main_menu_keyboard(user_id):
-    kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить"]]
+def get_main_menu_keyboard(user_id, role: str = "staff"):
+    """role игнорируется для ADMIN_ID (тот всегда получает полное админ-меню). Для остальных: 'accountant'
+    — урезанное read-only меню из 4 отчётов, ничего больше; любое другое значение (в т.ч. 'staff') —
+    обычное меню внесения операций, как раньше."""
     if user_id == ADMIN_ID:
-        kb[3].append("⏰ Напомнить")
+        kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "⏰ Напомнить"]]
         kb.append(["🔄 Синхр. Ozon", "🔄 Синхр. отзывы"])
         kb.append(["📦 Приёмка Ozon", "📊 Отчёт по поставкам"])
         kb.append(["💰 Выплаты Ozon", "📦 Остатки Ozon"])
-        kb.append(["🔑 Performance токен", "📢 Реклама Ozon"])
+        kb.append(["🔑 Performance токен", "📋 Список кампаний"])
         kb.append(["📢 Заказать отчёт", "📢 Статус отчёта"])
+        kb.append(["👥 Роли"])
+        return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+    if role == "accountant":
+        kb = [["🌰 Закупки сырья", "📦 Расходники"], ["💵 Зарплаты", "📉 Прочие расходы склада"]]
+        return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+    kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить"]]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 
@@ -876,7 +951,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     db: SupabaseService = context.bot_data.get("db")
     if db.is_approved(uid):
-        await update.message.reply_text(f"👋 Добро пожаловать! Вы в системе.\n\n{RULES_TEXT}", reply_markup=get_main_menu_keyboard(uid), parse_mode="Markdown")
+        await update.message.reply_text(f"👋 Добро пожаловать! Вы в системе.\n\n{RULES_TEXT}", reply_markup=get_main_menu_keyboard(uid, db.get_user_role(uid)), parse_mode="Markdown")
         return
 
     btn = [[KeyboardButton("📱 Поделиться контактом", request_contact=True)]]
@@ -908,7 +983,9 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    db = context.bot_data.get("db")
+    role = db.get_user_role(update.effective_user.id) if db else "staff"
+    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id, role))
     return ConversationHandler.END
 
 
@@ -968,6 +1045,8 @@ async def show_supply_comment(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def supply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     context.user_data["s_items"] = []
     await show_supply_category(update, context)
     return SUPPLY_CATEGORY
@@ -1179,6 +1258,8 @@ async def show_payment_comment(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     await show_payment_category(update, context)
     return PAYMENT_CATEGORY
 
@@ -1289,6 +1370,8 @@ async def payment_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BALANCE LOGIC ---
 async def balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     kb = [["🔍 Один контрагент", "📋 Все долги"], ["📗 Пробный баланс"], ["❌ Главное меню"]]
     await update.message.reply_text("📊 *Баланс*\n\nЧто показать?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return BALANCE_MODE
@@ -1357,6 +1440,8 @@ async def show_history_category(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def history_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     await show_history_category(update, context)
     return HISTORY_CATEGORY
 
@@ -1495,6 +1580,8 @@ async def history_reverse_confirm(update: Update, context: ContextTypes.DEFAULT_
 
 # --- WAREHOUSE (СКЛАД) ---
 async def warehouse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     kb = [["📤 Фасовка/Отгрузка", "📊 Остаток на складе"], ["💸 Постоянные расходы", "🚚 Логистика до МП"], ["👤 Сотрудники", "📋 История работ"], ["❌ Главное меню"]]
     await update.message.reply_text("🏭 *Склад*\n\nЧто делаем?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown")
     return WAREHOUSE_MENU
@@ -2421,6 +2508,8 @@ async def emp_accrual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- ПРОДАЖА (реальная прибыль: по площадкам, по товарам, чистыми) ---
 async def sale_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     t_now = datetime.now(TZ_MSK)
     this_month_start = t_now.replace(day=1).strftime("%d.%m")
     kb = [[f"Этот месяц (с {this_month_start})"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
@@ -4160,6 +4249,195 @@ async def ozon_stock_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_ozon_stock_debug_and_reply(update, context)
 
 
+# --- Роль "бухгалтер": read-only отчёты (без сценариев внесения операций) ---
+ACCOUNTANT_REPORT_TYPES = {
+    "🌰 Закупки сырья": "raw",
+    "📦 Расходники": "packaging",
+    "💵 Зарплаты": "salary",
+    "📉 Прочие расходы склада": "other",
+}
+
+
+def _cp_name(row: dict) -> str:
+    cp = row.get("counterparties")
+    return (cp or {}).get("name") or "—"
+
+
+def build_purchases_report_text(title: str, rows: list) -> str:
+    if not rows:
+        return f"{title}\n\nЗа период ничего не найдено."
+    lines = [f"{title}\n"]
+    total = 0.0
+    for r in rows:
+        amount = float(r["amount"])
+        total += amount
+        qty = r.get("quantity")
+        qty_str = f"{float(qty):.0f}" if qty is not None else "—"
+        price = r.get("price")
+        price_str = f"{float(price):.2f} ₽/ед" if price is not None else "—"
+        lines.append(f"▫️ {_format_date_ru(r.get('operation_date'))} | {r.get('item_name') or '—'} | {qty_str} | {price_str} | {amount:.2f} ₽ | {_cp_name(r)}")
+    lines.append(f"\n💰 Итого: {round(total,2)} ₽")
+    return "\n".join(lines)
+
+
+def build_salary_report_text(rows: list) -> str:
+    if not rows:
+        return "💵 Зарплаты\n\nЗа период ничего не найдено."
+    lines = ["💵 Зарплаты\n"]
+    total = 0.0
+    for r in rows:
+        amount = float(r["amount"])
+        total += amount
+        lines.append(f"▫️ {_format_date_ru(r.get('operation_date'))} | {_cp_name(r)} | {amount:.2f} ₽" + (f" | {r['comment']}" if r.get("comment") else ""))
+    lines.append(f"\n💰 Итого: {round(total,2)} ₽")
+    return "\n".join(lines)
+
+
+def build_other_expenses_report_text(rows: list) -> str:
+    if not rows:
+        return "📉 Прочие расходы склада\n\nЗа период ничего не найдено."
+    lines = ["📉 Прочие расходы склада\n"]
+    total = 0.0
+    for r in rows:
+        amount = float(r["amount"])
+        total += amount
+        cat = (r.get("categories") or {}).get("name") or "—"
+        lines.append(f"▫️ {_format_date_ru(r.get('operation_date'))} | {cat} | {amount:.2f} ₽ | {_cp_name(r)}" + (f" | {r['comment']}" if r.get("comment") else ""))
+    lines.append(f"\n💰 Итого: {round(total,2)} ₽")
+    return "\n".join(lines)
+
+
+async def accountant_report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    db = context.bot_data.get("db")
+    if db.get_user_role(update.effective_user.id) not in ("admin", "accountant"):
+        return ConversationHandler.END
+    report_type = ACCOUNTANT_REPORT_TYPES.get(t)
+    if not report_type:
+        return ConversationHandler.END
+    context.user_data["acc_report_type"] = report_type
+    kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text(f"{t}\n\nЗа какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ACC_REPORT_PERIOD
+
+
+async def _run_accountant_report(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from: str, date_to: str):
+    db = context.bot_data.get("db")
+    report_type = context.user_data.get("acc_report_type")
+    raw_cat_id = db.get_category_id("Закупка сырья (орехи/сухофрукты)")
+    packaging_cat_id = db.get_category_id("Расходники (упаковка, скотч, этикетки)")
+
+    if report_type == "raw":
+        text = build_purchases_report_text("🌰 Закупки сырья", db.get_purchases_report_rows(raw_cat_id, date_from, date_to))
+    elif report_type == "packaging":
+        text = build_purchases_report_text("📦 Расходники", db.get_purchases_report_rows(packaging_cat_id, date_from, date_to))
+    elif report_type == "salary":
+        text = build_salary_report_text(db.get_salary_report_rows(date_from, date_to))
+    elif report_type == "other":
+        text = build_other_expenses_report_text(db.get_other_warehouse_expenses_rows([raw_cat_id, packaging_cat_id], date_from, date_to))
+    else:
+        text = "⚠️ Не понял тип отчёта, начните заново."
+
+    role = db.get_user_role(update.effective_user.id)
+    for chunk in _chunk_text_by_lines(text):
+        await update.message.reply_text(chunk, reply_markup=get_main_menu_keyboard(update.effective_user.id, role))
+
+
+async def accountant_report_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    t_now = datetime.now(TZ_MSK)
+
+    if t == "Последние 3 дня":
+        date_from = (t_now.date() - timedelta(days=3)).isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_accountant_report(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if t == "Последние 30 дней":
+        date_from = (t_now.date() - timedelta(days=30)).isoformat()
+        date_to = t_now.date().isoformat()
+        await _run_accountant_report(update, context, date_from, date_to)
+        return ConversationHandler.END
+
+    if "Свой период" in t:
+        await update.message.reply_text("Введите период в формате ДД.ММ-ДД.ММ (например 01.07-31.07):", reply_markup=get_step_keyboard())
+        return ACC_REPORT_PERIOD_CUSTOM
+
+    kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
+    await update.message.reply_text("⚠️ Не понял выбор. Нажмите один из вариантов на клавиатуре:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ACC_REPORT_PERIOD
+
+
+async def accountant_report_period_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t == "❌ Главное меню": return await cancel_to_menu(update, context)
+    try:
+        start_raw, end_raw = t.split("-")
+        start_parsed = parse_flexible_date(start_raw.strip(), TZ_MSK)
+        end_parsed = parse_flexible_date(end_raw.strip(), TZ_MSK)
+        if not start_parsed or not end_parsed:
+            raise ValueError
+        date_from, date_to = start_parsed[0], end_parsed[0]
+    except (ValueError, AttributeError):
+        await update.message.reply_text("⚠️ Не понял период. Формат: ДД.ММ-ДД.ММ, например 01.07-31.07. Попробуйте ещё раз:", reply_markup=get_step_keyboard())
+        return ACC_REPORT_PERIOD_CUSTOM
+
+    await _run_accountant_report(update, context, date_from, date_to)
+    return ConversationHandler.END
+
+
+# --- Назначение роли (только админ) ---
+ROLE_LABELS = {"staff": "Сотрудник", "accountant": "Бухгалтер"}
+ROLE_LABEL_TO_VALUE = {v: k for k, v in ROLE_LABELS.items()}
+
+
+async def role_assign_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    db = context.bot_data.get("db")
+    users = db.get_approved_users_list()
+    if not users:
+        await update.message.reply_text("Одобренных пользователей ещё нет.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    user_by_label = {}
+    for u in users:
+        role_label = ROLE_LABELS.get(u.get("role") or "staff", u.get("role") or "staff")
+        label = f"{u.get('name') or u['user_id']} ({role_label})"
+        user_by_label[label] = u["user_id"]
+    context.user_data["role_user_by_label"] = user_by_label
+    await update.message.reply_text("Кому назначить роль?", reply_markup=build_grid_keyboard(list(user_by_label.keys()), columns=1))
+    return ROLE_ASSIGN_USER
+
+
+async def role_assign_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
+    user_by_label = context.user_data.get("role_user_by_label", {})
+    target_id = user_by_label.get(t)
+    if target_id is None:
+        await update.message.reply_text("Не найдено в списке. Выберите вариант с клавиатуры.")
+        return ROLE_ASSIGN_USER
+    context.user_data["role_target_user_id"] = target_id
+    kb = [["Сотрудник", "Бухгалтер"], ["❌ Главное меню"]]
+    await update.message.reply_text("Какую роль назначить?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    return ROLE_ASSIGN_ROLE
+
+
+async def role_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = update.message.text.strip()
+    if t in ("❌ Главное меню", "🔙 Назад"): return await cancel_to_menu(update, context)
+    role = ROLE_LABEL_TO_VALUE.get(t)
+    if not role:
+        await update.message.reply_text("⚠️ Выберите вариант с клавиатуры.")
+        return ROLE_ASSIGN_ROLE
+    db = context.bot_data.get("db")
+    target_id = context.user_data.get("role_target_user_id")
+    db.set_user_role(target_id, role)
+    await update.message.reply_text(f"✅ Роль обновлена: {t}.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
 # --- REMINDERS ---
 async def reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
@@ -4232,6 +4510,8 @@ async def reminder_time_select(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- CATALOG ADDERS ---
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get("db").get_user_role(update.effective_user.id) == "accountant":
+        return await cancel_to_menu(update, context)
     kb = [["🏢 Поставщик", "📦 Товар"], ["🗑 Удалить"], ["❌ Главное меню"]]
     await update.message.reply_text("➕ Что вы хотите сделать?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ADD_SELECT
@@ -4373,7 +4653,9 @@ async def last_records(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Страховка: если нажали кнопку вне активного диалога (например, после перезапуска),
     # не молчим, а сразу показываем главное меню.
-    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+    db = context.bot_data.get("db")
+    role = db.get_user_role(update.effective_user.id) if db else "staff"
+    await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id, role))
 
 
 async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -4412,7 +4694,7 @@ def main():
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
@@ -4424,7 +4706,7 @@ def main():
             PAYMENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAYMENT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     history_conv = ConversationHandler(
@@ -4435,7 +4717,7 @@ def main():
             HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
             HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
             HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     warehouse_conv = ConversationHandler(
@@ -4472,7 +4754,7 @@ def main():
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
             EMP_ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     sale_conv = ConversationHandler(
@@ -4480,7 +4762,7 @@ def main():
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     balance_conv = ConversationHandler(
@@ -4489,7 +4771,7 @@ def main():
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
             BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
         },
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     reminder_conv = ConversationHandler(
@@ -4499,7 +4781,7 @@ def main():
             REMINDER_INPUT_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_input_flow)],
             REMINDER_DATE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_date_select)],
             REMINDER_TIME_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_select)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     add_conv = ConversationHandler(
@@ -4514,7 +4796,7 @@ def main():
             DELETE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_type)],
             DELETE_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item)],
             DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -4534,56 +4816,70 @@ def main():
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. отзывы$"), ozon_feedback_sync_start)],
         states={
             OZON_FEEDBACK_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period)],
             OZON_FEEDBACK_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(feedback_edit_start, pattern="^ozfb_edit_")],
         states={
             FEEDBACK_EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_edit_text)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📦 Приёмка Ozon$"), ozon_supply_sync_start)],
         states={
             OZON_SUPPLY_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_sync_period)],
             OZON_SUPPLY_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📊 Отчёт по поставкам$"), ozon_supply_report_start)],
         states={
             OZON_SUPPLY_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_report_period)],
             OZON_SUPPLY_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_supply_report_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Выплаты Ozon$"), ozon_payouts_start)],
         states={
             OZON_PAYOUTS_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period)],
             OZON_PAYOUTS_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.Regex("^📦 Остатки Ozon$"), ozon_stock_debug))
     application.add_handler(MessageHandler(filters.Regex("^🔑 Performance токен$"), ozon_performance_token_debug))
-    application.add_handler(MessageHandler(filters.Regex("^📢 Реклама Ozon$"), ozon_performance_debug))
+    application.add_handler(MessageHandler(filters.Regex("^📋 Список кампаний$"), ozon_performance_debug))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📢 Заказать отчёт$"), perf_order_report_start)],
         states={
             PERF_ORDER_REPORT_CAMPAIGNS: [MessageHandler(filters.TEXT & ~filters.COMMAND, perf_order_report_campaigns)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^📢 Статус отчёта$"), perf_check_report_start)],
         states={
             PERF_CHECK_REPORT_UUID: [MessageHandler(filters.TEXT & ~filters.COMMAND, perf_check_report_uuid)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📢 Реклама Ozon|📢 Заказать отчёт|📢 Статус отчёта)$"), cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^(🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), accountant_report_start)],
+        states={
+            ACC_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period)],
+            ACC_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period_custom)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
+    ))
+    application.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^👥 Роли$"), role_assign_start)],
+        states={
+            ROLE_ASSIGN_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, role_assign_user)],
+            ROLE_ASSIGN_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, role_assign_role)],
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|📦 Приёмка Ozon|📊 Отчёт по поставкам|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада|👥 Роли)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
