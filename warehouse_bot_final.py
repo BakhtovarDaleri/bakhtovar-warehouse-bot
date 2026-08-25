@@ -883,6 +883,10 @@ def get_main_menu_keyboard(user_id, role: str = "staff"):
     if user_id == ADMIN_ID:
         kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "⏰ Напомнить"]]
         kb.append(["🔄 Синхр. Ozon", "🔄 Синхр. отзывы"])
+        # Рекламный кластер (Performance API) — временно оставлен в меню по просьбе пользователя,
+        # уберём отдельным шагом, когда он закончит пользоваться "Список кампаний" в текущем виде.
+        kb.append(["🔑 Performance токен", "📋 Список кампаний"])
+        kb.append(["📢 Заказать отчёт", "📢 Статус отчёта"])
         return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
     if role == "accountant":
