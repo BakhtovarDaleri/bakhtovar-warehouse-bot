@@ -4387,7 +4387,11 @@ async def _clear_stale_per_chat_commands(application: Application):
     cleared = 0
     for uid in chat_ids:
         try:
-            await application.bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=uid))
+            # ВАЖНО: set_my_commands([], scope=...) устанавливает ЯВНЫЙ пустой список для
+            # этого scope — он перекрывает глобальный список вместо того, чтобы снять override
+            # и вернуться к нему. delete_my_commands полностью убирает per-chat scope, и Telegram
+            # сам скатывается на глобальный список (где уже есть /start из PR #53).
+            await application.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
             cleared += 1
         except Exception:
             logger.exception(f"Не удалось очистить устаревшие per-chat команды для chat_id={uid}")
