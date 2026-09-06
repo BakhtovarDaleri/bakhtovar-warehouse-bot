@@ -882,7 +882,11 @@ def get_main_menu_keyboard(user_id, role: str = "staff"):
     обычное меню внесения операций, как раньше."""
     if user_id == ADMIN_ID:
         kb = [["📦 Закупка", "💰 Оплата"], ["🏭 Склад", "💵 Продажа"], ["📜 История", "📊 Баланс"], ["➕ Добавить", "⏰ Напомнить"]]
-        kb.append(["🔄 Синхр. Ozon", "🔄 Синхр. отзывы"])
+        kb.append(["🔄 Синхр. Ozon"])
+        # ВРЕМЕННО ОТКЛЮЧЕНО — подписка Ozon на управление отзывами не активна (отключили из-за
+        # стоимости), кнопка "🔄 Синхр. отзывы" убрана из меню. Раскомментировать при повторном
+        # подключении подписки (см. также job_queue.run_repeating(run_ozon_feedback_sync_job, ...) в main()).
+        # kb.append(["🔄 Синхр. отзывы"])
         # Рекламный кластер (Performance API) — временно оставлен в меню по просьбе пользователя,
         # уберём отдельным шагом, когда он закончит пользоваться "Список кампаний" в текущем виде.
         kb.append(["🔑 Performance токен", "📋 Список кампаний"])
@@ -4542,8 +4546,11 @@ def main():
         application.job_queue.run_daily(run_ozon_sync_job, time=datetime.strptime("04:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
         application.job_queue.run_repeating(run_ozon_supply_acceptance_sync_job, interval=timedelta(hours=4), first=120)
     application.job_queue.run_daily(run_fixed_costs_job, time=datetime.strptime("05:00", "%H:%M").time().replace(tzinfo=TZ_MSK))
-    if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY and ANTHROPIC_API_KEY:
-        application.job_queue.run_repeating(run_ozon_feedback_sync_job, interval=timedelta(minutes=OZON_FEEDBACK_SYNC_MINUTES), first=60)
+    # ВРЕМЕННО ОТКЛЮЧЕНО — подписка Ozon на управление отзывами не активна (отключили из-за
+    # стоимости), эти вызовы к API Ozon будут падать 403. Раскомментировать при повторном
+    # подключении подписки (см. также кнопку "🔄 Синхр. отзывы" в get_main_menu_keyboard()).
+    # if OZON_BULAT_CLIENT_ID and OZON_BULAT_API_KEY and ANTHROPIC_API_KEY:
+    #     application.job_queue.run_repeating(run_ozon_feedback_sync_job, interval=timedelta(minutes=OZON_FEEDBACK_SYNC_MINUTES), first=60)
 
     application.add_error_handler(global_error_handler)
 
