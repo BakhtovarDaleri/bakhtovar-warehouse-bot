@@ -18,7 +18,7 @@ load_dotenv()
 
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -4357,10 +4357,15 @@ async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+async def post_init(application: Application):
+    """Регистрирует команды в системном меню Telegram (иконка рядом с полем ввода)."""
+    await application.bot.set_my_commands([BotCommand("start", "🏠 Главное меню")])
+
+
 def main():
     db_service = SupabaseService()
     os.makedirs(DATA_DIR, exist_ok=True)
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     application.bot_data["db"] = db_service
 
     supply_conv = ConversationHandler(
