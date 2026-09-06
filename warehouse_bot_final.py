@@ -18,7 +18,7 @@ load_dotenv()
 
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+    InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -717,6 +717,10 @@ class SupabaseService:
     def is_approved(self, user_id: int) -> bool:
         res = self.client.table("approved_users").select("user_id").eq("user_id", user_id).execute()
         return len(res.data or []) > 0
+
+    def get_all_approved_user_ids(self) -> list:
+        res = self.client.table("approved_users").select("user_id").execute()
+        return [r["user_id"] for r in (res.data or [])]
 
     def approve_user(self, user_id: int, name: str, phone: str):
         self.client.table("approved_users").insert({"user_id": user_id, "name": name, "phone": phone}).execute()
@@ -4360,6 +4364,34 @@ async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     """Регистрирует команды в системном меню Telegram (иконка рядом с полем ввода)."""
     await application.bot.set_my_commands([BotCommand("start", "🏠 Главное меню")])
+    await _clear_stale_per_chat_commands(application)
+
+
+async def _clear_stale_per_chat_commands(application: Application):
+    """ОДНОРАЗОВАЯ очистка (можно удалить эту функцию и вызов выше после подтверждения, что
+    старое меню больше ни у кого не всплывает). В шаге 1 (PR #54, откачен в PR #55) команды
+    регистрировались per-chat через BotCommandScopeChat(chat_id=...) — это хранится на
+    серверах Telegram привязанным к конкретному chat_id, а не в нашем коде, поэтому откат
+    кода не стёр то, что уже было отправлено для чатов, успевших нажать /start или вернуться
+    в меню, пока шаг 1 был живым. Явно чистим per-chat override для каждого известного
+    пользователя (все approved_users + ADMIN_ID), чтобы у них остался только глобальный
+    список команд (сейчас — один /start)."""
+    db = application.bot_data.get("db")
+    chat_ids = set()
+    if db:
+        try:
+            chat_ids.update(db.get_all_approved_user_ids())
+        except Exception:
+            logger.exception("Не удалось получить approved_users для очистки per-chat команд")
+    chat_ids.add(ADMIN_ID)
+    cleared = 0
+    for uid in chat_ids:
+        try:
+            await application.bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=uid))
+            cleared += 1
+        except Exception:
+            logger.exception(f"Не удалось очистить устаревшие per-chat команды для chat_id={uid}")
+    logger.info(f"Очистка устаревших per-chat команд ☰-меню: обработано {cleared}/{len(chat_ids)} chat_id")
 
 
 def main():
