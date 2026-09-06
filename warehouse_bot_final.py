@@ -18,7 +18,7 @@ load_dotenv()
 
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
+    InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -876,59 +876,6 @@ def build_grid_keyboard(buttons_list, columns=2, add_navigation=True):
     return ReplyKeyboardMarkup(grid, resize_keyboard=True)
 
 
-# --- Команды ☰-меню (Шаг 1: параллельно кнопкам, кнопки не убираем) ---
-BOT_COMMAND_START = BotCommand("start", "🏠 Главное меню")
-
-ADMIN_COMMANDS = [
-    BotCommand("purchase", "📦 Закупка"),
-    BotCommand("pay", "💰 Оплата"),
-    BotCommand("warehouse", "🏭 Склад"),
-    BotCommand("sale", "💵 Продажа"),
-    BotCommand("history", "📜 История операций"),
-    BotCommand("balance", "📊 Баланс"),
-    BotCommand("add", "➕ Добавить поставщика/товар"),
-    BotCommand("remind", "⏰ Умное напоминание"),
-    BotCommand("ozonsync", "🔄 Синхр. Ozon"),
-    BotCommand("perftoken", "🔑 Performance токен"),
-    BotCommand("campaigns", "📋 Список кампаний Ozon"),
-    BotCommand("perfreport", "📢 Заказать отчёт Performance"),
-    BotCommand("perfstatus", "📢 Статус отчёта Performance"),
-]
-
-STAFF_COMMANDS = [
-    BotCommand("purchase", "📦 Закупка"),
-    BotCommand("pay", "💰 Оплата"),
-    BotCommand("warehouse", "🏭 Склад"),
-    BotCommand("sale", "💵 Продажа"),
-    BotCommand("history", "📜 История операций"),
-    BotCommand("balance", "📊 Баланс"),
-    BotCommand("add", "➕ Добавить поставщика/товар"),
-]
-
-ACCOUNTANT_COMMANDS = [
-    BotCommand("rawreport", "🌰 Закупки сырья (отчёт)"),
-    BotCommand("packreport", "📦 Расходники (отчёт)"),
-    BotCommand("salaryreport", "💵 Зарплаты (отчёт)"),
-    BotCommand("otherreport", "📉 Прочие расходы склада (отчёт)"),
-]
-
-# Общий список для fallbacks — набранная команда любого раздела прерывает текущий диалог
-# точно так же, как сейчас это делает нажатие любой другой кнопки главного меню.
-ALL_TOP_LEVEL_COMMANDS = [c.command for c in ADMIN_COMMANDS + ACCOUNTANT_COMMANDS]
-
-
-async def set_role_commands(bot, user_id: int, role: str):
-    """Per-chat команды в ☰-меню (BotCommandScopeChat полностью переопределяет дефолтный
-    список для этого чата, поэтому /start включаем в каждый набор явно)."""
-    if user_id == ADMIN_ID:
-        commands = [BOT_COMMAND_START] + ADMIN_COMMANDS
-    elif role == "accountant":
-        commands = [BOT_COMMAND_START] + ACCOUNTANT_COMMANDS
-    else:
-        commands = [BOT_COMMAND_START] + STAFF_COMMANDS
-    await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=user_id))
-
-
 def get_main_menu_keyboard(user_id, role: str = "staff"):
     """role игнорируется для ADMIN_ID (тот всегда получает полное админ-меню). Для остальных: 'accountant'
     — урезанное read-only меню из 4 отчётов, ничего больше; любое другое значение (в т.ч. 'staff') —
@@ -963,9 +910,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     db: SupabaseService = context.bot_data.get("db")
     if db.is_approved(uid):
-        role = db.get_user_role(uid)
-        await set_role_commands(context.bot, uid, role)
-        await update.message.reply_text(f"👋 Добро пожаловать! Вы в системе.\n\n{RULES_TEXT}", reply_markup=get_main_menu_keyboard(uid, role), parse_mode="Markdown")
+        await update.message.reply_text(f"👋 Добро пожаловать! Вы в системе.\n\n{RULES_TEXT}", reply_markup=get_main_menu_keyboard(uid, db.get_user_role(uid)), parse_mode="Markdown")
         return
 
     btn = [[KeyboardButton("📱 Поделиться контактом", request_contact=True)]]
@@ -999,7 +944,6 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.bot_data.get("db")
     role = db.get_user_role(update.effective_user.id) if db else "staff"
-    await set_role_commands(context.bot, update.effective_user.id, role)
     await update.message.reply_text("Возврат в главное меню.", reply_markup=get_main_menu_keyboard(update.effective_user.id, role))
     return ConversationHandler.END
 
@@ -4094,29 +4038,14 @@ def build_other_expenses_report_text(rows: list) -> str:
     return "\n".join(lines)
 
 
-ACCOUNTANT_COMMAND_TO_REPORT = {
-    "rawreport": ("🌰 Закупки сырья", "raw"),
-    "packreport": ("📦 Расходники", "packaging"),
-    "salaryreport": ("💵 Зарплаты", "salary"),
-    "otherreport": ("📉 Прочие расходы склада", "other"),
-}
-
-
 async def accountant_report_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     db = context.bot_data.get("db")
     if db.get_user_role(update.effective_user.id) not in ("admin", "accountant"):
         return ConversationHandler.END
-    if t.startswith("/"):
-        command = t[1:].split("@")[0].split()[0]
-        mapped = ACCOUNTANT_COMMAND_TO_REPORT.get(command)
-        if not mapped:
-            return ConversationHandler.END
-        t, report_type = mapped
-    else:
-        report_type = ACCOUNTANT_REPORT_TYPES.get(t)
-        if not report_type:
-            return ConversationHandler.END
+    report_type = ACCOUNTANT_REPORT_TYPES.get(t)
+    if not report_type:
+        return ConversationHandler.END
     context.user_data["acc_report_type"] = report_type
     kb = [["Последние 3 дня"], ["Последние 30 дней"], ["Свой период (ДД.ММ-ДД.ММ)"], ["❌ Главное меню"]]
     await update.message.reply_text(f"{t}\n\nЗа какой период?", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
@@ -4440,7 +4369,7 @@ def main():
     application.bot_data["db"] = db_service
 
     supply_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📦 Закупка$"), supply_start), CommandHandler("purchase", supply_start)],
+        entry_points=[MessageHandler(filters.Regex("^📦 Закупка$"), supply_start)],
         states={
             SUPPLY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_category)],
             SUPPLY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_supplier)],
@@ -4450,11 +4379,11 @@ def main():
             SUPPLY_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_comment)],
             SUPPLY_ADD_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_add_more)],
             SUPPLY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, supply_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     payment_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start), CommandHandler("pay", payment_start)],
+        entry_points=[MessageHandler(filters.Regex("^💰 Оплата$"), payment_start)],
         states={
             PAYMENT_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_category)],
             PAYMENT_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_supplier)],
@@ -4462,22 +4391,22 @@ def main():
             PAYMENT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_type)],
             PAYMENT_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_comment)],
             PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     history_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📜 История$"), history_start), CommandHandler("history", history_start)],
+        entry_points=[MessageHandler(filters.Regex("^📜 История$"), history_start)],
         states={
             HISTORY_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_category)],
             HISTORY_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_supplier)],
             HISTORY_REVERSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_select)],
             HISTORY_REVERSE_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_number)],
             HISTORY_REVERSE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_reverse_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     warehouse_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start), CommandHandler("warehouse", warehouse_start)],
+        entry_points=[MessageHandler(filters.Regex("^🏭 Склад$"), warehouse_start)],
         states={
             WAREHOUSE_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_menu)],
             WAREHOUSE_OUT_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, warehouse_out_ip)],
@@ -4510,38 +4439,38 @@ def main():
             EMP_ACCRUAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_amount)],
             EMP_ACCRUAL_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_comment)],
             EMP_ACCRUAL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, emp_accrual_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     sale_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^💵 Продажа$"), sale_start), CommandHandler("sale", sale_start)],
+        entry_points=[MessageHandler(filters.Regex("^💵 Продажа$"), sale_start)],
         states={
             SALE_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_ip)],
             SALE_MARKETPLACE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sale_marketplace)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     balance_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start), CommandHandler("balance", balance_start)],
+        entry_points=[MessageHandler(filters.Regex("^📊 Баланс$"), balance_start)],
         states={
             BALANCE_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_mode)],
             BALANCE_SUPPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, balance_calculate)],
         },
-        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     reminder_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^⏰ Напомнить$"), reminder_start), CommandHandler("remind", reminder_start)],
+        entry_points=[MessageHandler(filters.Regex("^⏰ Напомнить$"), reminder_start)],
         states={
             REMINDER_TYPE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_type_select)],
             REMINDER_INPUT_FLOW: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_input_flow)],
             REMINDER_DATE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_date_select)],
             REMINDER_TIME_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, reminder_time_select)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     add_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Добавить$"), add_start), CommandHandler("add", add_start)],
+        entry_points=[MessageHandler(filters.Regex("^➕ Добавить$"), add_start)],
         states={
             ADD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_select)],
             ADD_SUPPLIER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_supplier_phone)],
@@ -4552,7 +4481,7 @@ def main():
             DELETE_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_type)],
             DELETE_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_item)],
             DELETE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_confirm)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -4568,58 +4497,53 @@ def main():
     application.add_handler(reminder_conv)
     application.add_handler(add_conv)
     application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_start), CommandHandler("ozonsync", ozon_sync_start)],
+        entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. Ozon$"), ozon_sync_start)],
         states={
             OZON_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period)],
             OZON_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^🔄 Синхр. отзывы$"), ozon_feedback_sync_start)],
         states={
             OZON_FEEDBACK_SYNC_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period)],
             OZON_FEEDBACK_SYNC_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_feedback_sync_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(feedback_edit_start, pattern="^ozfb_edit_")],
         states={
             FEEDBACK_EDIT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_edit_text)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💰 Выплаты Ozon$"), ozon_payouts_start)],
         states={
             OZON_PAYOUTS_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period)],
             OZON_PAYOUTS_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, ozon_payouts_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.Regex("^📦 Остатки Ozon$"), ozon_stock_debug))
     application.add_handler(MessageHandler(filters.Regex("^🔑 Performance токен$"), ozon_performance_token_debug))
-    application.add_handler(CommandHandler("perftoken", ozon_performance_token_debug))
     application.add_handler(MessageHandler(filters.Regex("^📋 Список кампаний$"), ozon_performance_debug))
-    application.add_handler(CommandHandler("campaigns", ozon_performance_debug))
     application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📢 Заказать отчёт$"), perf_order_report_start), CommandHandler("perfreport", perf_order_report_start)],
+        entry_points=[MessageHandler(filters.Regex("^📢 Заказать отчёт$"), perf_order_report_start)],
         states={
             PERF_ORDER_REPORT_CAMPAIGNS: [MessageHandler(filters.TEXT & ~filters.COMMAND, perf_order_report_campaigns)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📢 Статус отчёта$"), perf_check_report_start), CommandHandler("perfstatus", perf_check_report_start)],
+        entry_points=[MessageHandler(filters.Regex("^📢 Статус отчёта$"), perf_check_report_start)],
         states={
             PERF_CHECK_REPORT_UUID: [MessageHandler(filters.TEXT & ~filters.COMMAND, perf_check_report_uuid)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex(r"^(🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), accountant_report_start),
-            CommandHandler(["rawreport", "packreport", "salaryreport", "otherreport"], accountant_report_start),
-        ],
+        entry_points=[MessageHandler(filters.Regex(r"^(🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), accountant_report_start)],
         states={
             ACC_REPORT_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period)],
             ACC_REPORT_PERIOD_CUSTOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, accountant_report_period_custom)],
-        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu), CommandHandler(ALL_TOP_LEVEL_COMMANDS, cancel_to_menu)]
+        }, fallbacks=[MessageHandler(filters.Regex(r"^(❌ Главное меню|📦 Закупка|💰 Оплата|🏭 Склад|👤 Сотрудники|📜 История|📊 Баланс|➕ Добавить|⏰ Напомнить|🔄 Синхр\. Ozon|🔄 Синхр\. отзывы|💰 Выплаты Ozon|📦 Остатки Ozon|🔑 Performance токен|📋 Список кампаний|📢 Заказать отчёт|📢 Статус отчёта|🌰 Закупки сырья|📦 Расходники|💵 Зарплаты|📉 Прочие расходы склада)$"), cancel_to_menu)]
     ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
