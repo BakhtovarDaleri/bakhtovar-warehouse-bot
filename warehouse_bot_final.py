@@ -2227,7 +2227,7 @@ async def show_emp_shift_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     t_now = datetime.now(TZ_MSK)
     d0 = t_now.strftime("%d.%m")
     d1 = (t_now - timedelta(days=1)).strftime("%d.%m")
-    kb = [[f"Сегодня ({d0})", f"Вчера ({d1})"], ["🔙 Назад", "❌ Главное меню"]]
+    kb = [[f"Сегодня ({d0})", f"Вчера ({d1})"], ["Другая дата (ДД.ММ)"], ["🔙 Назад", "❌ Главное меню"]]
     await update.message.reply_text(
         "Шаг 2: За какой день смена?\nМожно нажать кнопку, или просто написать число (напр. `15` или `15.07`):",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True), parse_mode="Markdown"
@@ -2266,6 +2266,10 @@ async def emp_shift_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         emps = [e["name"] for e in db.get_hourly_employees()]
         await update.message.reply_text("Шаг 1: Выберите сотрудника:", reply_markup=build_grid_keyboard(emps, columns=2))
         return EMP_SHIFT_EMPLOYEE
+
+    if t == "Другая дата (ДД.ММ)":
+        await update.message.reply_text("Введите дату в формате ДД.ММ (например 03.09):", reply_markup=get_step_keyboard())
+        return EMP_SHIFT_DATE
 
     raw = t.split("(")[0].strip() if "(" in t else t
     parsed = parse_flexible_date(raw, TZ_MSK)
